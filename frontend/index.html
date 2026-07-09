@@ -286,6 +286,48 @@ async function fetchRoute(coords){
   return data.routes[0].geometry.coordinates.map(c => [c[1], c[0]]);
 }
 
+// ---- Пройденный трек по дорогам (OSRM map-matching) ----
+// Записанные GPS-точки — шумные и разреженные, поэтому прямые между ними «срезают» углы.
+// /match подгоняет трассу к дорожной сети. Возвращает [[lat,lng]…]; никогда не бросает —
+// не сматчившийся кусок кладём сырыми точками, чтобы не потерять трек.
+
+// Прореживаем очень длинный трек: не заваливаем публичный OSRM запросами,
+// дороги между точками всё равно достраиваются самим матчингом.
+function thinPoints(pts, cap){
+  if (pts.length <= cap) return pts;
+  const step = Math.ceil(pts.length / cap), out = [];
+  for (let i = 0; i < pts.length; i += step) out.push(pts[i]);
+  if (out[out.length - 1] !== pts[pts.length - 1]) out.push(pts[pts.length - 1]);
+  return out;
+}
+
+async function matchToRoads(points){
+  points = thinPoints(points, 1000);
+  const MAX = 100, out = [];              // публичный демо-OSRM ограничивает /match ~100 точками
+  for (let i = 0; i < points.length; i += MAX - 1){    // нахлёст в 1 точку, чтобы чанки стыковались
+    const chunk = points.slice(i, i + MAX);
+    if (chunk.length < 2){
+      if (chunk.length) out.push([chunk[0].lat, chunk[0].lng]);
+      break;
+    }
+    try{
+      const coords = chunk.map(p => `${p.lng},${p.lat}`).join(';');
+      const rad = chunk.map(p => Math.min(Math.max(Math.round(p.acc || 25), 12), 50)).join(';');
+      const ts  = chunk.every(p => p.t) ? '&timestamps=' + chunk.map(p => p.t).join(';') : '';
+      const url = `https://router.project-osrm.org/match/v1/driving/${coords}`
+                + `?geometries=geojson&overview=full&tidy=true&gaps=split&radiuses=${rad}${ts}`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error('http ' + res.status);
+      const data = await res.json();
+      if (data.code !== 'Ok' || !data.matchings || !data.matchings.length) throw new Error(data.code || 'no match');
+      data.matchings.forEach(m => (m.geometry.coordinates || []).forEach(c => out.push([c[1], c[0]])));
+    }catch(e){
+      chunk.forEach(p => out.push([p.lat, p.lng]));     // чанк не сматчился — оставляем прямые
+    }
+  }
+  return out;
+}
+
 function metaText(d){
   if (d.rest) return "Днёвка (отдых)";
   if (d.meta) return d.meta;
@@ -799,14 +841,16 @@ function installPhotos(trackKey){
   }
 
   // --- Отрисовка записанного трека (тёмная линия + точки + «последняя точка») ---
-  let trailLine=null, trailHead=null, trailDots=[];
+  let trailLine=null, trailHead=null, trailDots=[], trailGen=0;
   function drawTrail(points){
+    const gen = ++trailGen;                 // инвалидируем прошлые фоновые матчинги (polling каждые 30 с)
     if (trailLine){ map.removeLayer(trailLine); trailLine=null; }
     if (trailHead){ map.removeLayer(trailHead); trailHead=null; }
     trailDots.forEach(m=>map.removeLayer(m)); trailDots=[];
     if (!points || !points.length) return;
     const ll = points.map(p=>[p.lat,p.lng]);
-    trailLine = L.polyline(ll, { color:'#111', weight:3, opacity:.6 }).addTo(map);
+    // Сначала — сырые прямые между геоточками (пунктир, мгновенная обратная связь)…
+    trailLine = L.polyline(ll, { color:'#111', weight:3, opacity:.6, dashArray:'4,6' }).addTo(map);
     points.forEach(p => trailDots.push(
       L.circleMarker([p.lat,p.lng], { radius:2.5, color:'#111', weight:1, fillOpacity:.6 }).addTo(map)));
     const last = points[points.length-1];
@@ -814,6 +858,14 @@ function installPhotos(trackKey){
     const when = new Date((last.t||0)*1000).toLocaleString('ru-RU');
     trailHead = L.marker([last.lat,last.lng], { icon, zIndexOffset:1500 }).addTo(map)
        .bindPopup(`<b>Последняя точка трека</b><br>${when}` + navBlock(last.lat, last.lng));
+    // …затем в фоне подгоняем пройденный путь к дорогам и заменяем линию на сплошную
+    if (points.length >= 2){
+      matchToRoads(points).then(line => {
+        if (gen !== trailGen || !trailLine || !line || line.length < 2) return;   // трек успел обновиться
+        trailLine.setLatLngs(line);
+        trailLine.setStyle({ dashArray:null });     // сплошная = едем по дорогам
+      }).catch(()=>{ /* матчинг не удался — оставляем сырую линию */ });
+    }
   }
   async function loadTrail(){
     try{
