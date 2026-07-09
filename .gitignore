@@ -1,0 +1,9 @@
+node_modules/
+vendor/
+.env
+.env.*
+*.log
+dist/
+build/
+.cache/
+.DS_Store
