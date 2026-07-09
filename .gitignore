@@ -1,7 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+env/
+
+# Node / прочее
 node_modules/
 vendor/
+
+# Secrets / env
 .env
 .env.*
+
+# Runtime data (генерится бэкендом, не хранить в репозитории)
+trail.json
+photos.json
+photos/
+*.sqlite3
+
+# Logs / build / misc
 *.log
 dist/
 build/
