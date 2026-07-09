@@ -291,6 +291,9 @@ async function fetchRoute(coords){
 // /match подгоняет трассу к дорожной сети. Возвращает [[lat,lng]…]; никогда не бросает —
 // не сматчившийся кусок кладём сырыми точками, чтобы не потерять трек.
 
+// Быстрый строковый хэш (djb2) — ключи для кэша дорог в localStorage.
+function hashStr(s){ let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0; return (h >>> 0).toString(36); }
+
 // Прореживаем очень длинный трек: не заваливаем публичный OSRM запросами,
 // дороги между точками всё равно достраиваются самим матчингом.
 function thinPoints(pts, cap){
@@ -301,30 +304,37 @@ function thinPoints(pts, cap){
   return out;
 }
 
+// Сматчить один чанк (≤100 точек) к дорогам; при любой ошибке — сырые прямые.
+async function matchChunk(chunk){
+  if (chunk.length < 2) return chunk.map(p => [p.lat, p.lng]);
+  try{
+    const coords = chunk.map(p => `${p.lng},${p.lat}`).join(';');
+    const rad = chunk.map(p => Math.min(Math.max(Math.round(p.acc || 25), 12), 50)).join(';');
+    const ts  = chunk.every(p => p.t) ? '&timestamps=' + chunk.map(p => p.t).join(';') : '';
+    const url = `https://router.project-osrm.org/match/v1/driving/${coords}`
+              + `?geometries=geojson&overview=full&tidy=true&gaps=split&radiuses=${rad}${ts}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('http ' + res.status);
+    const data = await res.json();
+    if (data.code !== 'Ok' || !data.matchings || !data.matchings.length) throw new Error(data.code || 'no match');
+    const line = [];
+    data.matchings.forEach(m => (m.geometry.coordinates || []).forEach(c => line.push([c[1], c[0]])));
+    return line.length ? line : chunk.map(p => [p.lat, p.lng]);
+  }catch(e){
+    return chunk.map(p => [p.lat, p.lng]);           // чанк не сматчился — оставляем прямые
+  }
+}
+
 async function matchToRoads(points){
   points = thinPoints(points, 1000);
-  const MAX = 100, out = [];              // публичный демо-OSRM ограничивает /match ~100 точками
-  for (let i = 0; i < points.length; i += MAX - 1){    // нахлёст в 1 точку, чтобы чанки стыковались
-    const chunk = points.slice(i, i + MAX);
-    if (chunk.length < 2){
-      if (chunk.length) out.push([chunk[0].lat, chunk[0].lng]);
-      break;
-    }
-    try{
-      const coords = chunk.map(p => `${p.lng},${p.lat}`).join(';');
-      const rad = chunk.map(p => Math.min(Math.max(Math.round(p.acc || 25), 12), 50)).join(';');
-      const ts  = chunk.every(p => p.t) ? '&timestamps=' + chunk.map(p => p.t).join(';') : '';
-      const url = `https://router.project-osrm.org/match/v1/driving/${coords}`
-                + `?geometries=geojson&overview=full&tidy=true&gaps=split&radiuses=${rad}${ts}`;
-      const res = await fetch(url);
-      if (!res.ok) throw new Error('http ' + res.status);
-      const data = await res.json();
-      if (data.code !== 'Ok' || !data.matchings || !data.matchings.length) throw new Error(data.code || 'no match');
-      data.matchings.forEach(m => (m.geometry.coordinates || []).forEach(c => out.push([c[1], c[0]])));
-    }catch(e){
-      chunk.forEach(p => out.push([p.lat, p.lng]));     // чанк не сматчился — оставляем прямые
-    }
+  const MAX = 100, chunks = [];            // публичный демо-OSRM ограничивает /match ~100 точками
+  for (let i = 0; i < points.length; i += MAX - 1){   // нахлёст в 1 точку, чтобы чанки стыковались
+    chunks.push(points.slice(i, i + MAX));
+    if (i + MAX >= points.length) break;
   }
+  const parts = await Promise.all(chunks.map(matchChunk));   // все чанки — параллельно, порядок держит Promise.all
+  const out = [];
+  parts.forEach(part => part.forEach(c => out.push(c)));
   return out;
 }
 
@@ -342,6 +352,7 @@ function metaText(d){
 
 // Состояние
 let PHOTOS = [], photoLayer = null;
+let onPhotosChanged = null;      // хук: фото — тоже геоточки пройденного пути (ставит init)
 let gridEl = null, viewerEl = null, uploadEl = null;
 let viewSet = [], viewIdx = 0, viewKey = null;
 
@@ -456,6 +467,7 @@ async function loadPhotos(){
     const d = await res.json();
     PHOTOS = (d.photos || []).slice();
     renderPhotoMarkers();
+    if (typeof onPhotosChanged === 'function') onPhotosChanged();   // включить координаты фото в трек
   }catch(e){ /* бэкенда может не быть — не критично */ }
 }
 
@@ -769,16 +781,20 @@ function installPhotos(trackKey){
     poly.bindPopup(`<b>${d.day} · ${d.from} → ${d.to}</b><br>${metaText(d)}<br><span style="color:#555">${d.note||''}</span>`);
     routeLayers[d.day] = poly;
   });
-  (async () => {
-    for (const d of days){
-      if (d.coords.length < 2) continue;
-      try {
-        const line = await fetchRoute(d.coords);
-        routeLayers[d.day].setLatLngs(line);
-        routeLayers[d.day].setStyle({ dashArray:null });   // сплошная = по дорогам
-      } catch (e){ console.warn('Роут не построен для', d.day, e); }
-    }
-  })();
+  Promise.all(days.map(async d => {          // все дни строим параллельно, а не по очереди
+    if (d.coords.length < 2) return;
+    try {
+      const key = 'viettrip:route:' + hashStr(d.coords.map(c => c.join(',')).join(';'));
+      let line = null;                       // кэш планового маршрута (не дёргаем OSRM на каждой перезагрузке)
+      try { const v = localStorage.getItem(key); if (v){ const a = JSON.parse(v); if (Array.isArray(a) && a.length >= 2) line = a; } } catch(e){}
+      if (!line){
+        line = await fetchRoute(d.coords);
+        try { if (line && line.length >= 2) localStorage.setItem(key, JSON.stringify(line)); } catch(e){}
+      }
+      routeLayers[d.day].setLatLngs(line);
+      routeLayers[d.day].setStyle({ dashArray:null });   // сплошная = по дорогам
+    } catch (e){ console.warn('Роут не построен для', d.day, e); }
+  }));
 
   // Подсветка активного участка
   function highlight(day){
@@ -842,8 +858,49 @@ function installPhotos(trackKey){
 
   // --- Отрисовка записанного трека (тёмная линия + точки + «последняя точка») ---
   let trailLine=null, trailHead=null, trailDots=[], trailGen=0;
+  let trailPoints=[];                          // сырой трек из /api/trail
+  let lastDrawnKey=null;                        // подпись отрисованного пути — чтобы не перерисовывать зря
+  const roadCache={ key:null, line:null };      // кэш дорог в памяти (переживает 30-сек. поллинг)
+
+  // Подпись набора точек → ключ кэша
+  function pointsKey(pts){
+    return hashStr(pts.map(p => `${p.lat.toFixed(5)},${p.lng.toFixed(5)},${p.t||0}`).join(';'));
+  }
+  // Кэш дорог трека в localStorage: держим только актуальный ключ (трек растёт, старое не нужно)
+  function loadTrailRoads(key){
+    try{ const v=localStorage.getItem('viettrip:trail:'+key); return v?JSON.parse(v):null; }catch(e){ return null; }
+  }
+  function saveTrailRoads(key, line){
+    try{
+      for (let i=localStorage.length-1;i>=0;i--){ const k=localStorage.key(i); if(k&&k.startsWith('viettrip:trail:')) localStorage.removeItem(k); }
+      localStorage.setItem('viettrip:trail:'+key, JSON.stringify(line));
+    }catch(e){ /* переполнение хранилища — не критично */ }
+  }
+
+  // Пройденный путь = точки трека + координаты фото, упорядоченные по времени,
+  // со схлопыванием точек ближе 100 м к предыдущей оставленной.
+  function traveledPoints(){
+    const raw=[];
+    (trailPoints||[]).forEach(p => { if (isFinite(p.lat)&&isFinite(p.lng)) raw.push({lat:p.lat,lng:p.lng,t:p.t||0,acc:p.acc}); });
+    (PHOTOS||[]).forEach(p     => { if (isFinite(p.lat)&&isFinite(p.lng)) raw.push({lat:p.lat,lng:p.lng,t:p.t||0}); });
+    raw.sort((a,b)=>(a.t||0)-(b.t||0));
+    const out=[];
+    for (const p of raw){
+      const last=out[out.length-1];
+      if (!last || distM([last.lat,last.lng],[p.lat,p.lng])>=100) out.push(p);
+      else if ((p.t||0)>(last.t||0)) last.t=p.t;      // ближе 100 м — схлопнуть, оставить более позднее время
+    }
+    return out;
+  }
+
+  function applyRoadLine(line, gen){
+    if (gen!==trailGen || !trailLine || !line || line.length<2) return;
+    trailLine.setLatLngs(line);
+    trailLine.setStyle({ dashArray:null });          // сплошная = едем по дорогам
+  }
+
   function drawTrail(points){
-    const gen = ++trailGen;                 // инвалидируем прошлые фоновые матчинги (polling каждые 30 с)
+    const gen = ++trailGen;
     if (trailLine){ map.removeLayer(trailLine); trailLine=null; }
     if (trailHead){ map.removeLayer(trailHead); trailHead=null; }
     trailDots.forEach(m=>map.removeLayer(m)); trailDots=[];
@@ -858,21 +915,36 @@ function installPhotos(trackKey){
     const when = new Date((last.t||0)*1000).toLocaleString('ru-RU');
     trailHead = L.marker([last.lat,last.lng], { icon, zIndexOffset:1500 }).addTo(map)
        .bindPopup(`<b>Последняя точка трека</b><br>${when}` + navBlock(last.lat, last.lng));
-    // …затем в фоне подгоняем пройденный путь к дорогам и заменяем линию на сплошную
-    if (points.length >= 2){
-      matchToRoads(points).then(line => {
-        if (gen !== trailGen || !trailLine || !line || line.length < 2) return;   // трек успел обновиться
-        trailLine.setLatLngs(line);
-        trailLine.setStyle({ dashArray:null });     // сплошная = едем по дорогам
-      }).catch(()=>{ /* матчинг не удался — оставляем сырую линию */ });
-    }
+    if (points.length < 2) return;
+
+    // …затем дороги: сперва кэш (память → localStorage), иначе матчинг с сохранением в кэш
+    const key = pointsKey(points);
+    if (roadCache.key===key && roadCache.line){ applyRoadLine(roadCache.line, gen); return; }
+    const cached = loadTrailRoads(key);
+    if (cached && cached.length>=2){ roadCache.key=key; roadCache.line=cached; applyRoadLine(cached, gen); return; }
+    matchToRoads(points).then(line => {
+      if (!line || line.length<2) return;
+      roadCache.key=key; roadCache.line=line; saveTrailRoads(key, line);
+      applyRoadLine(line, gen);
+    }).catch(()=>{ /* матчинг не удался — остаётся сырая линия */ });
   }
+
+  // Перерисовать пройденный путь (трек + фото). Пропускаем, если ничего не изменилось.
+  function redrawTraveled(){
+    const pts = traveledPoints();
+    const key = pts.length ? pointsKey(pts) : 'empty';
+    if (key === lastDrawnKey) return;               // данные те же — не дёргаем карту и OSRM
+    lastDrawnKey = key;
+    drawTrail(pts);
+  }
+
   async function loadTrail(){
     try{
       const res = await fetch('/api/trail', { cache:'no-store' });
       if(!res.ok) return;
       const d = await res.json();
-      drawTrail(d.points || []);
+      trailPoints = d.points || [];
+      redrawTraveled();
     }catch(e){ /* трекера может не быть — не критично */ }
   }
 
@@ -905,6 +977,8 @@ function installPhotos(trackKey){
   // --- Режим записи (есть секрет) ---
   function appendTrailPoint(lat,lng){
     const t=Math.floor(Date.now()/1000);
+    trailPoints.push({lat,lng,t});             // держим сырой трек в актуальном состоянии
+    lastDrawnKey=null;                         // локально дорисовали — следующий redraw пройдёт заново
     if(!trailLine){ drawTrail([{lat,lng,t}]); return; }
     trailLine.addLatLng([lat,lng]);
     trailDots.push(L.circleMarker([lat,lng],{ radius:2.5, color:'#111', weight:1, fillOpacity:.6 }).addTo(map));
@@ -934,6 +1008,7 @@ function installPhotos(trackKey){
     }, { enableHighAccuracy:true, maximumAge:5000, timeout:20000 });
   }
 
+  onPhotosChanged = redrawTraveled;   // теперь загрузка/добавление фото перерисовывает пройденный путь
   await loadTrail();
   if(TRACK_KEY){ startRecording(); }
   else { setInterval(() => { loadTrail(); loadPhotos(); }, 30000); }   // просмотр — подтягиваем трек и фото каждые 30 с
