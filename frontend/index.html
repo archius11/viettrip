@@ -307,21 +307,33 @@ function thinPoints(pts, cap){
   return out;
 }
 
-// Проложить дороги через один чанк точек; при любой ошибке — прямые + ok=false.
-async function routeChunk(chunk){
-  if (chunk.length < 2) return { line: chunk.map(p => [p.lat, p.lng]), ok: true };
+// Проложить дороги через последовательность точек. Возвращает { line, retry }.
+// Если /route не построил маршрут (между какой-то парой точек нет дороги — фото
+// снято над лагуной, оторванный GPS-фикс и т.п.), НЕ бракуем весь участок: делим
+// пополам и повторяем, чтобы «прямой» осталась только реально непроходимая пара.
+//   retry=true  → временная ошибка (429/сеть) — результат не кэшируем, повторим позже
+//   retry=false → окончательно (либо дороги, либо честная прямая на непроходимом куске)
+async function routeSpan(pts){
+  if (pts.length < 2) return { line: pts.map(p => [p.lat, p.lng]), retry: false };
+  const coords = pts.map(p => `${p.lng},${p.lat}`).join(';');
+  const url = `https://router.project-osrm.org/route/v1/driving/${coords}?overview=full&geometries=geojson`;
+  let data;
   try{
-    const coords = chunk.map(p => `${p.lng},${p.lat}`).join(';');
-    const url = `https://router.project-osrm.org/route/v1/driving/${coords}?overview=full&geometries=geojson`;
     const res = await fetch(url);
-    if (!res.ok) throw new Error('http ' + res.status);
-    const data = await res.json();
-    if (data.code !== 'Ok' || !data.routes || !data.routes.length) throw new Error(data.code || 'no route');
-    const line = data.routes[0].geometry.coordinates.map(c => [c[1], c[0]]);
-    return line.length >= 2 ? { line, ok: true } : { line: chunk.map(p => [p.lat, p.lng]), ok: false };
+    if (!res.ok) return { line: pts.map(p => [p.lat, p.lng]), retry: true };   // 429/5xx — не бисектим, повторим позже
+    data = await res.json();
   }catch(e){
-    return { line: chunk.map(p => [p.lat, p.lng]), ok: false };   // кусок не построился — прямые
+    return { line: pts.map(p => [p.lat, p.lng]), retry: true };                // сеть/JSON — повторим позже
   }
+  if (data.code === 'Ok' && data.routes && data.routes[0]){
+    const line = data.routes[0].geometry.coordinates.map(c => [c[1], c[0]]);
+    if (line.length >= 2) return { line, retry: false };
+  }
+  // Сервер ответил, но между какими-то точками дороги нет
+  if (pts.length === 2) return { line: pts.map(p => [p.lat, p.lng]), retry: false };  // непроходимая пара — прямая, окончательно
+  const mid = pts.length >> 1;                                                         // делим и изолируем проблемный участок
+  const [a, b] = await Promise.all([ routeSpan(pts.slice(0, mid + 1)), routeSpan(pts.slice(mid)) ]);
+  return { line: a.line.concat(b.line.slice(1)), retry: a.retry || b.retry };
 }
 
 async function roadsThrough(points){
@@ -331,10 +343,13 @@ async function roadsThrough(points){
     chunks.push(points.slice(i, i + MAX));
     if (i + MAX >= points.length) break;
   }
-  const parts = await Promise.all(chunks.map(routeChunk));   // все чанки — параллельно, порядок держит Promise.all
-  const line = []; let ok = true;
-  parts.forEach(part => { part.line.forEach(c => line.push(c)); if (!part.ok) ok = false; });
-  return { line, ok };
+  const parts = await Promise.all(chunks.map(routeSpan));   // все чанки — параллельно, порядок держит Promise.all
+  const line = []; let retry = false;
+  parts.forEach((part, idx) => {
+    (idx ? part.line.slice(1) : part.line).forEach(c => line.push(c));   // idx>0: снять стыковую точку-нахлёст
+    if (part.retry) retry = true;
+  });
+  return { line, ok: !retry };   // ok=true → результат окончательный, можно кэшировать
 }
 
 function metaText(d){
