@@ -237,7 +237,7 @@
 //  этот файл трогать не нужно. Координаты в JSON: [широта, долгота].
 // ============================================================================
 
-console.log('viettrip build: manual-points v5');   // маркер версии — видно в консоли, если файл свежий
+console.log('viettrip build: point-times v6');   // маркер версии — видно в консоли, если файл свежий
 
 // ---- Карта (слои) ----
 const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -263,6 +263,7 @@ if (window.matchMedia('(max-width:760px)').matches) setSheet(true);   // на т
 const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent)
             || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 const r6 = n => Math.round(n * 1e6) / 1e6;
+function fmtTime(sec){ return sec ? new Date(sec * 1000).toLocaleString('ru-RU') : '—'; }
 function gmapUrl(lat, lng){ return `https://www.google.com/maps/dir/?api=1&destination=${lat},${lng}&travelmode=driving`; }
 function amapUrl(lat, lng){ return `https://maps.apple.com/?daddr=${lat},${lng}&dirflg=d`; }
 function navButtons(lat, lng){
@@ -556,7 +557,8 @@ function openViewer(list, idx){ viewSet = list; viewIdx = idx; buildModals(); re
 function renderViewer(){
   const p = viewSet[viewIdx]; if (!p) return;
   viewerEl.querySelector('.ph-view img').src = p.full;
-  viewerEl.querySelector('.ph-count').textContent = `${viewIdx+1} / ${viewSet.length}`;
+  viewerEl.querySelector('.ph-count').textContent =
+    `${viewIdx+1} / ${viewSet.length}` + (p.t ? ` · ${fmtTime(p.t)}` : '');
   const multi = viewSet.length > 1;
   viewerEl.querySelector('.ph-prev').style.visibility = multi ? 'visible' : 'hidden';
   viewerEl.querySelector('.ph-next').style.visibility = multi ? 'visible' : 'hidden';
@@ -977,8 +979,16 @@ function installPhotos(trackKey){
     const ll = points.map(p=>[p.lat,p.lng]);
     // Сначала — сырые прямые между геоточками (пунктир, мгновенная обратная связь)…
     trailLine = L.polyline(ll, { color:'#111', weight:3, opacity:.6, dashArray:'4,6' }).addTo(map);
-    points.forEach(p => trailDots.push(
-      L.circleMarker([p.lat,p.lng], { radius:2.5, color:'#111', weight:1, fillOpacity:.6 }).addTo(map)));
+    // Точки-«хлебные крошки». Владельцу (секретная ссылка) — крупнее и с попапом даты-времени,
+    // чтобы видеть время соседних точек и осмысленно выставлять время новой ручной точке.
+    points.forEach(p => {
+      const dot = L.circleMarker([p.lat,p.lng],
+        { radius: TRACK_KEY ? 4 : 2.5, color:'#111', weight:1, fillOpacity:.6 }).addTo(map);
+      if (TRACK_KEY) dot.bindPopup(
+        `<div class="navpop-title">Точка трека</div>` +
+        `<div class="navpop-coord">${fmtTime(p.t)}<br>${r6(p.lat)}, ${r6(p.lng)}</div>`);
+      trailDots.push(dot);
+    });
     const last = points[points.length-1];
     const icon = L.divIcon({ className:'', iconSize:[14,14], iconAnchor:[7,7], html:'<div class="pin-live"></div>' });
     const when = new Date((last.t||0)*1000).toLocaleString('ru-RU');
@@ -1088,7 +1098,6 @@ function installPhotos(trackKey){
   let lastManualT = Math.floor(Date.now() / 1000);   // «память» времени: следующая точка +1 мин
   const addHint = '<span class="rec-dot" style="background:#7c4dff"></span>тапайте карту, чтобы добавить точку';
 
-  const fmtTime = sec => new Date(sec * 1000).toLocaleString('ru-RU');
   function toLocalInput(sec){                          // epoch → значение для <input datetime-local> (локальное время)
     const d = new Date(sec * 1000), p = n => String(n).padStart(2, '0');
     return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
