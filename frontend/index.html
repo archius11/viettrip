@@ -78,11 +78,30 @@
   .pin-live { width:14px; height:14px; border-radius:50%; background:#0d47a1; border:3px solid #fff;
               box-shadow:0 0 4px rgba(0,0,0,.5); }
   @keyframes pulse { 0%{box-shadow:0 0 0 0 rgba(33,150,243,.55)} 70%{box-shadow:0 0 0 14px rgba(33,150,243,0)} 100%{box-shadow:0 0 0 0 rgba(33,150,243,0)} }
+  /* точка трека, добавленная вручную (видна только владельцу) — фиолетовый ромб */
+  .pin-manual { width:12px; height:12px; background:#7c4dff; border:2px solid #fff;
+                transform:rotate(45deg); box-shadow:0 0 4px rgba(0,0,0,.5); }
 
   .track-panel { margin:6px 0 12px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
   .track-btn { font:inherit; font-size:12.5px; padding:6px 10px; border:1px solid var(--line);
                background:#fff; border-radius:8px; cursor:pointer; }
   .track-btn:hover { box-shadow:0 2px 8px rgba(0,0,0,.12); }
+  .track-btn.active { background:#7c4dff; color:#fff; border-color:#6a3de8; }
+  /* форма ручной точки в попапе */
+  .mpt-lbl { display:block; font-size:12px; color:#555; margin:8px 0 2px; }
+  .mpt-dt  { font:inherit; font-size:13px; padding:6px 8px; border:1px solid #ccc;
+             border-radius:8px; width:100%; box-sizing:border-box; margin-top:3px; }
+  .mpt-del { width:100%; margin-top:8px; background:#fff; color:#b00020; border:1px solid #e0b4bb;
+             border-radius:8px; padding:8px 10px; font:inherit; font-size:12.5px; cursor:pointer; }
+  .mpt-del:hover { background:#fff0f2; }
+  .mpt-row { display:flex; gap:6px; margin-top:8px; }
+  .mpt-btn { flex:1; border-radius:8px; padding:8px 10px; font:inherit; font-size:13px;
+             font-weight:600; cursor:pointer; border:1px solid transparent; }
+  .mpt-cancel { background:#fff; color:#333; border-color:#ccc; }
+  .mpt-cancel:hover { background:#f4f4f4; }
+  .mpt-add { background:#7c4dff; color:#fff; border-color:#6a3de8; }
+  .mpt-add:hover { background:#6a3de8; }
+  .mpt-add:disabled { opacity:.6; cursor:default; }
   .track-status { font-size:12px; color:#666; }
   .rec-dot { display:inline-block; width:9px; height:9px; border-radius:50%; background:#2e7d32;
              margin-right:5px; animation:pulse 1.6s infinite; }
@@ -201,6 +220,7 @@
     <div class="track-panel">
       <button class="track-btn" id="locateBtn">📍 Где я</button>
       <button class="track-btn" id="photoBtn" style="display:none">📷 Добавить фото</button>
+      <button class="track-btn" id="pointBtn" style="display:none">➕ Точка</button>
       <input type="file" id="photoInput" accept="image/*" multiple hidden>
       <span class="track-status" id="trackStatus"></span>
     </div>
@@ -217,7 +237,7 @@
 //  этот файл трогать не нужно. Координаты в JSON: [широта, долгота].
 // ============================================================================
 
-console.log('viettrip build: roads-bisect-throttle v4');   // маркер версии — видно в консоли, если файл свежий
+console.log('viettrip build: manual-points v5');   // маркер версии — видно в консоли, если файл свежий
 
 // ---- Карта (слои) ----
 const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -264,8 +284,10 @@ window.viettripCopy = function(text, btn){
 // Клик по пустой точке карты (не по маркеру/линии) — попап с навигацией.
 // Если задан photoPlaceCb (владелец ставит точку для фото без геометки) — перехватываем клик.
 let photoPlaceCb = null;
+let pointPlaceCb = null;          // режим «добавить точку трека» (владелец) — многоразовый, не обнуляем
 map.on('click', e => {
   if (photoPlaceCb){ const cb = photoPlaceCb; photoPlaceCb = null; cb(e.latlng); return; }
+  if (pointPlaceCb){ pointPlaceCb(e.latlng); return; }
   const lat = r6(e.latlng.lat), lng = r6(e.latlng.lng);
   const html =
     `<div class="navpop">` +
@@ -993,6 +1015,7 @@ function installPhotos(trackKey){
       const d = await res.json();
       trailPoints = d.points || [];
       redrawTraveled();
+      redrawManual();
     }catch(e){ /* трекера может не быть — не критично */ }
   }
 
@@ -1054,6 +1077,97 @@ function installPhotos(trackKey){
     }, err=>{
       setStatus('<span style="color:#b00020">нет доступа к геолокации: '+err.message+'</span>');
     }, { enableHighAccuracy:true, maximumAge:5000, timeout:20000 });
+  }
+
+  // ================= Ручное добавление точек трека (владелец) =================
+  // Забыл открыть страницу с ключом → трек не писался. Здесь можно достроить его:
+  // тапнуть по карте, задать дату-время — точка ляжет в трек (POST /api/point) и
+  // попадёт в пройденный путь наравне с GPS-фиксами и координатами фото.
+  const manualLayer = L.layerGroup().addTo(map);
+  let addMode = false;
+  let lastManualT = Math.floor(Date.now() / 1000);   // «память» времени: следующая точка +1 мин
+  const addHint = '<span class="rec-dot" style="background:#7c4dff"></span>тапайте карту, чтобы добавить точку';
+
+  const fmtTime = sec => new Date(sec * 1000).toLocaleString('ru-RU');
+  function toLocalInput(sec){                          // epoch → значение для <input datetime-local> (локальное время)
+    const d = new Date(sec * 1000), p = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+  }
+
+  // Маркеры ручных точек — только владельцу, для проверки и удаления (в трек-линию они
+  // и так входят через traveledPoints). Строим из сырого trailPoints, без схлопывания —
+  // чтобы каждую можно было удалить, даже если рядом есть другая.
+  function redrawManual(){
+    manualLayer.clearLayers();
+    if (!TRACK_KEY) return;
+    (trailPoints || []).forEach(p => {
+      if (!p.m || !p.id) return;
+      const icon = L.divIcon({ className:'', iconSize:[12,12], iconAnchor:[6,6], html:'<div class="pin-manual"></div>' });
+      const div = document.createElement('div'); div.className = 'navpop';
+      div.innerHTML = `<div class="navpop-title">Точка трека (вручную)</div>` +
+                      `<div class="navpop-coord">${fmtTime(p.t)}<br>${r6(p.lat)}, ${r6(p.lng)}</div>` +
+                      `<button class="mpt-del">🗑 Удалить</button>`;
+      div.querySelector('.mpt-del').addEventListener('click', async () => {
+        try{
+          const r = await fetch('/api/point?id=' + encodeURIComponent(p.id),
+                                { method:'DELETE', headers:{ 'X-Trip-Key':TRACK_KEY } });
+          if (r.ok){ trailPoints = trailPoints.filter(x => x.id !== p.id);
+                     map.closePopup(); lastDrawnKey = null; redrawManual(); redrawTraveled(); }
+          else setStatus('<span style="color:#b00020">не удалось удалить точку</span>');
+        }catch(e){ setStatus('<span style="color:#b00020">нет связи с сервером</span>'); }
+      });
+      L.marker([p.lat, p.lng], { icon, zIndexOffset:1200 }).addTo(manualLayer).bindPopup(div);
+    });
+  }
+
+  function openAddForm(ll){
+    const lat = +ll.lat.toFixed(6), lng = +ll.lng.toFixed(6);
+    const div = document.createElement('div'); div.className = 'navpop';
+    div.innerHTML =
+      `<div class="navpop-title">Новая точка трека</div>` +
+      `<div class="navpop-coord">${lat}, ${lng}</div>` +
+      `<label class="mpt-lbl">Дата и время</label>` +
+      `<input type="datetime-local" class="mpt-dt" value="${toLocalInput(lastManualT + 60)}">` +
+      `<div class="mpt-row">` +
+        `<button class="mpt-btn mpt-cancel">Отмена</button>` +
+        `<button class="mpt-btn mpt-add">Добавить</button></div>`;
+    const pop = L.popup({ maxWidth:260, autoClose:false, closeOnClick:false })
+                 .setLatLng(ll).setContent(div).openOn(map);
+    div.querySelector('.mpt-cancel').addEventListener('click', () => map.closePopup(pop));
+    div.querySelector('.mpt-add').addEventListener('click', async () => {
+      const v = div.querySelector('.mpt-dt').value;
+      const t = v ? Math.floor(new Date(v).getTime() / 1000) : Math.floor(Date.now() / 1000);
+      if (!isFinite(t) || t <= 0){ setStatus('<span style="color:#b00020">неверная дата</span>'); return; }
+      const btn = div.querySelector('.mpt-add'); btn.disabled = true; btn.textContent = '…';
+      try{
+        const r = await fetch('/api/point', { method:'POST',
+          headers:{ 'Content-Type':'application/json', 'X-Trip-Key':TRACK_KEY },
+          body: JSON.stringify({ lat, lng, t }) });
+        if (r.status === 401){ setStatus('<span style="color:#b00020">неверный ключ записи</span>'); btn.disabled = false; btn.textContent = 'Добавить'; return; }
+        const j = await r.json().catch(() => ({}));
+        if (r.ok && j.id){
+          trailPoints.push({ lat, lng, t, id:j.id, m:1 });
+          lastManualT = t; lastDrawnKey = null;
+          map.closePopup(pop); redrawManual(); redrawTraveled();
+          setStatus('<span style="color:#0a7">точка добавлена ✓</span>');
+          setTimeout(() => { if (addMode) setStatus(addHint); }, 1200);
+        } else { setStatus('<span style="color:#b00020">не удалось добавить точку</span>'); btn.disabled = false; btn.textContent = 'Добавить'; }
+      }catch(e){ setStatus('<span style="color:#b00020">нет связи с сервером</span>'); btn.disabled = false; btn.textContent = 'Добавить'; }
+    });
+  }
+
+  function setAddMode(on){
+    addMode = on;
+    pointPlaceCb = on ? openAddForm : null;
+    const btn = document.getElementById('pointBtn');
+    if (btn){ btn.classList.toggle('active', on); btn.textContent = on ? '✓ Готово' : '➕ Точка'; }
+    document.getElementById('map').style.cursor = on ? 'crosshair' : '';
+    if (on) setStatus(addHint); else { map.closePopup(); if (!TRACK_KEY) setStatus(''); }
+  }
+
+  if (TRACK_KEY){
+    const pb = document.getElementById('pointBtn');
+    if (pb){ pb.style.display = ''; pb.addEventListener('click', () => setAddMode(!addMode)); }
   }
 
   onPhotosChanged = redrawTraveled;   // теперь загрузка/добавление фото перерисовывает пройденный путь

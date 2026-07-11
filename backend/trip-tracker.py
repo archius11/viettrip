@@ -3,11 +3,15 @@
 Мини-бэкенд трека поездки (без внешних зависимостей, только стандартная библиотека).
 
 Маршруты:
-  GET    /api/trail   -> {"points":[{lat,lng,t,acc?}...], "updated":ts}   (публично)
+  GET    /api/trail   -> {"points":[{lat,lng,t,acc?,id?,m?}...], "updated":ts}   (публично)
   GET    /api/health  -> {"ok":true}
-  POST   /api/ping    -> добавить точку. Тело {lat,lng,acc?}. Заголовок X-Trip-Key: <секрет>
+  POST   /api/ping    -> добавить точку живого трека. Тело {lat,lng,acc?}. Заголовок X-Trip-Key
+  POST   /api/point   -> добавить точку ВРУЧНУЮ. Тело {lat,lng,t?}. Заголовок X-Trip-Key.
+                         Вставляется в трек по времени, помечается {id, m:1}.
+  DELETE /api/point   -> удалить ручную точку по id (?id=...). Заголовок X-Trip-Key
   DELETE /api/trail   -> очистить трек. Заголовок X-Trip-Key: <секрет>
 
+(Фото-маршруты /api/photo[s] — ниже в обработчике.)
 Слушает 127.0.0.1:$TRIP_PORT (за nginx). Данные — JSON-файл $TRIP_DATA.
 """
 import json, os, time, threading, base64, re
@@ -56,6 +60,25 @@ def _dist_m(a, b):
     la1, lo1, la2, lo2 = map(radians, (a[0], a[1], b[0], b[1]))
     h = sin((la2 - la1) / 2) ** 2 + cos(la1) * cos(la2) * sin((lo2 - lo1) / 2) ** 2
     return 2 * 6371000 * asin(sqrt(h))
+
+
+def _insert_point(d, pt):
+    """Вставить точку в d['points'] по времени (трек держим отсортированным по t).
+    Живые пинги идут «сейчас» и садятся в конец; ручные точки могут быть в прошлом —
+    их место находим бинарным поиском. Фронт всё равно сортирует по t, порядок на
+    сервере — только гигиена и предсказуемый MAX_POINTS."""
+    pts = d["points"]
+    t = pt["t"]
+    lo, hi = 0, len(pts)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if pts[mid].get("t", 0) <= t:
+            lo = mid + 1
+        else:
+            hi = mid
+    pts.insert(lo, pt)
+    if len(pts) > MAX_POINTS:
+        d["points"] = pts[-MAX_POINTS:]
 
 
 def _load_photos():
@@ -119,6 +142,8 @@ class Handler(BaseHTTPRequestHandler):
         p = self._path()
         if p == "/api/photo":
             return self._photo_delete()
+        if p == "/api/point":
+            return self._point_delete()
         if p != "/api/trail":
             return self._send(404, {"error": "not found"})
         if not self._authed():
@@ -131,6 +156,8 @@ class Handler(BaseHTTPRequestHandler):
         p = self._path()
         if p == "/api/photo":
             return self._photo_post()
+        if p == "/api/point":
+            return self._point_post()
         if p != "/api/ping":
             return self._send(404, {"error": "not found"})
         if not self._authed():
@@ -172,6 +199,52 @@ class Handler(BaseHTTPRequestHandler):
             d["updated"] = now
             _save(d)
             return self._send(200, {"ok": True, "points": len(d["points"])})
+
+    def _point_post(self):
+        """Ручная точка трека: {lat,lng,t?}. t — Unix-секунды (если нет — сейчас).
+        Вставляется по времени, получает id и метку m:1 (чтобы фронт мог её удалить)."""
+        if not self._authed():
+            return self._send(401, {"error": "bad key"})
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+            if n <= 0 or n > MAX_BODY:
+                raise ValueError("len")
+            body = json.loads(self.rfile.read(n).decode("utf-8"))
+            lat = float(body["lat"]); lng = float(body["lng"])
+            if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+                raise ValueError("range")
+            t = body.get("t")
+            t = int(t) if t is not None else int(time.time())
+            if not (0 < t < 4102444800):        # 1970 < t < 2100 — отсекаем мусор
+                raise ValueError("t")
+        except Exception:
+            return self._send(400, {"error": "bad body"})
+
+        pid = "%d_%s" % (int(time.time()), os.urandom(4).hex())
+        pt = {"lat": round(lat, 6), "lng": round(lng, 6), "t": t, "id": pid, "m": 1}
+        with _lock:
+            d = _load()
+            _insert_point(d, pt)
+            d["updated"] = int(time.time())
+            _save(d)
+            return self._send(200, {"ok": True, "id": pid, "points": len(d["points"])})
+
+    def _point_delete(self):
+        """Удалить ручную точку по id. Живые точки id не имеют — их так не тронуть."""
+        if not self._authed():
+            return self._send(401, {"error": "bad key"})
+        pid = (parse_qs(urlparse(self.path).query).get("id") or [""])[0]
+        if not ID_RE.match(pid):
+            return self._send(400, {"error": "bad id"})
+        with _lock:
+            d = _load()
+            keep = [p for p in d["points"] if p.get("id") != pid]
+            if len(keep) == len(d["points"]):
+                return self._send(404, {"error": "not found"})
+            d["points"] = keep
+            d["updated"] = int(time.time())
+            _save(d)
+        return self._send(200, {"ok": True, "points": len(keep)})
 
     def _photo_post(self):
         if not self._authed():
