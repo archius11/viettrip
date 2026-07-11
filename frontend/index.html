@@ -217,7 +217,7 @@
 //  этот файл трогать не нужно. Координаты в JSON: [широта, долгота].
 // ============================================================================
 
-console.log('viettrip build: roads-bisect-throttle v3');   // маркер версии — видно в консоли, если файл свежий
+console.log('viettrip build: roads-bisect-throttle v4');   // маркер версии — видно в консоли, если файл свежий
 
 // ---- Карта (слои) ----
 const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -342,16 +342,21 @@ async function routeSpan(pts){
   let data;
   try{
     const res = await osrmFetch(url);
-    if (!res.ok) return { line: pts.map(p => [p.lat, p.lng]), retry: true };   // 429/5xx (после ретраев) — повторим позже
-    data = await res.json();
+    // Только 429/5xx (после ретраев osrmFetch) — временная ошибка: прямая, повторим позже.
+    // ВАЖНО: 400 сюда НЕ попадает. OSRM на «нет дороги между точками» отвечает 400 с телом
+    // {code:"NoRoute"} — это ПОСТОЯННАЯ ситуация, её надо изолировать делением (ниже), а не
+    // ретраить. Раньше здесь стоял `if(!res.ok)`, и один непроходимый стык (напр. оторванный
+    // GPS-фикс над морем) превращал весь 90-точечный чанк в прямую навсегда.
+    if (res.status === 429 || res.status >= 500) return { line: pts.map(p => [p.lat, p.lng]), retry: true };
+    data = await res.json();                    // OSRM отдаёт JSON и на 400 (тело с code)
   }catch(e){
     return { line: pts.map(p => [p.lat, p.lng]), retry: true };                // сеть/JSON — повторим позже
   }
-  if (data.code === 'Ok' && data.routes && data.routes[0]){
+  if (data && data.code === 'Ok' && data.routes && data.routes[0]){
     const line = data.routes[0].geometry.coordinates.map(c => [c[1], c[0]]);
     if (line.length >= 2) return { line, retry: false };
   }
-  // Сервер ответил, но между какими-то точками дороги нет
+  // Сервер ответил (200 code!=Ok ЛИБО 400 NoRoute), но между какими-то точками дороги нет
   if (pts.length === 2) return { line: pts.map(p => [p.lat, p.lng]), retry: false };  // непроходимая пара — прямая, окончательно
   const mid = pts.length >> 1;                                                         // делим и изолируем проблемный участок
   const [a, b] = await Promise.all([ routeSpan(pts.slice(0, mid + 1)), routeSpan(pts.slice(mid)) ]);
