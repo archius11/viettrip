@@ -32,6 +32,8 @@
   .sidebar .total { font-size:13px; margin:10px 0 14px; padding:8px 10px; background:#fff;
                     border:1px solid var(--line); border-radius:8px; }
   .total b { font-size:15px; }
+  .total-real { margin-top:7px; padding-top:7px; border-top:1px solid var(--line); }
+  .total-real:empty { display:none; }
 
   .day-card { background:#fff; border:1px solid var(--line); border-left:6px solid #ccc;
               border-radius:8px; padding:9px 11px; margin-bottom:8px; cursor:pointer;
@@ -250,7 +252,7 @@
 //  этот файл трогать не нужно. Координаты в JSON: [широта, долгота].
 // ============================================================================
 
-console.log('viettrip build: point-edit v8');   // маркер версии — видно в консоли, если файл свежий
+console.log('viettrip build: traveled-km v9');   // маркер версии — видно в консоли, если файл свежий
 
 // ---- Карта (слои) ----
 const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -970,7 +972,8 @@ function installPhotos(trackKey){
   // ---- Сайдбар ----
   const totalKm = track.reduce((s,d) => s + (typeof d.km === 'number' ? d.km : 0), 0);
   document.getElementById('total').innerHTML =
-    `<b>≈ ${totalKm} км</b> ходовых<br><span style="color:#666">без учёта дня виза-рана (08.07)</span>`;
+    `<b>≈ ${totalKm} км</b> ходовых по плану<br><span style="color:#666">без учёта дня виза-рана (08.07)</span>` +
+    `<div class="total-real" id="traveledTotal"></div>`;
   const sheetLabel = document.getElementById('sheetLabel');
   if (sheetLabel) sheetLabel.textContent = `Дни маршрута · ≈${totalKm} км`;
 
@@ -1053,8 +1056,28 @@ function installPhotos(trackKey){
       .sort((a,b) => a.t - b.t);
   }
 
+  // --- Пройдено километров ---
+  // Считаем по той же геометрии, что нарисована: пока дороги строятся — по прямым между
+  // точками (заниженная оценка), потом — по проложенной линии.
+  const traveledEl = document.getElementById('traveledTotal');
+  function lineKm(parts){
+    let m = 0;
+    parts.forEach(a => { for (let i = 1; i < a.length; i++) m += distM(a[i-1], a[i]); });
+    return m / 1000;
+  }
+  function showTraveled(km, straightKm){
+    if (!traveledEl) return;
+    if (!(km > 0)){ traveledEl.innerHTML = ''; return; }
+    const note = straightKm == null
+      ? '<span style="color:#666">по прямым, дороги ещё строятся…</span>'
+      : (straightKm >= 1 ? `<span style="color:#666">из них ≈ ${Math.round(straightKm)} км по прямой (вне дорог)</span>` : '');
+    traveledEl.innerHTML = `<b>≈ ${Math.round(km)} км</b> пройдено${note ? '<br>' + note : ''}`;
+  }
+
   function applyRoadLine(lines, gen){
     if (gen!==trailGen || !lines) return;
+    const straightKm = lineKm(lines.straight);
+    showTraveled(lineKm(lines.road) + straightKm, straightKm);
     if (trailLine){ map.removeLayer(trailLine); trailLine=null; }                    // сырой пунктир больше не нужен
     if (trailRoad){ map.removeLayer(trailRoad); trailRoad=null; }
     if (trailStraight){ map.removeLayer(trailStraight); trailStraight=null; }
@@ -1160,10 +1183,11 @@ function installPhotos(trackKey){
     [trailLine, trailRoad, trailStraight, trailHead].forEach(l => { if (l) map.removeLayer(l); });
     trailLine = trailRoad = trailStraight = trailHead = null;
     trailDots.forEach(m=>map.removeLayer(m)); trailDots=[];
-    if (!points || !points.length) return;
+    if (!points || !points.length){ showTraveled(0); return; }
     const ll = points.map(p=>[p.lat,p.lng]);
     // Сначала — сырые прямые между геоточками (пунктир, мгновенная обратная связь)…
     trailLine = L.polyline(ll, { color:'#111', weight:3, opacity:.6, dashArray:'4,6' }).addTo(map);
+    showTraveled(lineKm([ll]), null);            // черновая оценка, пока не построены дороги
     points.forEach(p => trailDots.push(pointMarker(p)));
     const last = points[points.length-1];
     const icon = L.divIcon({ className:'', iconSize:[14,14], iconAnchor:[7,7], html:'<div class="pin-live"></div>' });
