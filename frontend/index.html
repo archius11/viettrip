@@ -252,7 +252,7 @@
 //  этот файл трогать не нужно. Координаты в JSON: [широта, долгота].
 // ============================================================================
 
-console.log('viettrip build: traveled-km v9');   // маркер версии — видно в консоли, если файл свежий
+console.log('viettrip build: no-map-navpop v10');   // маркер версии — видно в консоли, если файл свежий
 
 // ---- Карта (слои) ----
 const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -297,22 +297,14 @@ window.viettripCopy = function(text, btn){
          t.select(); try { document.execCommand('copy'); } catch(e){} t.remove(); done(); }
 };
 
-// Клик по пустой точке карты (не по маркеру/линии) — попап с навигацией.
-// Если задан photoPlaceCb (владелец ставит точку для фото без геометки) — перехватываем клик.
+// Клик по пустой точке карты используют только режимы владельца (постановка точки трека
+// или координаты фото без геометки). Попапа «Навигация в эту точку» на пустом месте больше
+// нет — он мешал редактировать трек; ссылки на навигацию остались в попапах маркеров.
 let photoPlaceCb = null;
 let pointPlaceCb = null;          // режим «добавить точку трека» (владелец) — многоразовый, не обнуляем
 map.on('click', e => {
   if (photoPlaceCb){ const cb = photoPlaceCb; photoPlaceCb = null; cb(e.latlng); return; }
-  if (pointPlaceCb){ pointPlaceCb(e.latlng); return; }
-  const lat = r6(e.latlng.lat), lng = r6(e.latlng.lng);
-  const html =
-    `<div class="navpop">` +
-      `<div class="navpop-title">Навигация в эту точку</div>` +
-      `<div class="navpop-coord">${lat}, ${lng}</div>` +
-      navButtons(lat, lng) +
-      `<button class="navbtn c" onclick="viettripCopy('${gmapUrl(lat,lng)}', this)">🔗 Копировать ссылку</button>` +
-    `</div>`;
-  L.popup({ maxWidth:240 }).setLatLng(e.latlng).setContent(html).openOn(map);
+  if (pointPlaceCb) pointPlaceCb(e.latlng);
 });
 
 // ---- Роутинг по дорогам через публичный OSRM ----
