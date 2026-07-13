@@ -106,6 +106,14 @@
   .mpt-add:hover { background:#6a3de8; }
   .mpt-add:disabled { opacity:.6; cursor:default; }
   .mpt-hint { font-size:11px; color:#888; margin-top:6px; text-align:center; }
+  .mpt-ghost { background:#f6f4ff; color:#5b32d6; border-color:#d8ccff; font-weight:500; font-size:12px; }
+  .mpt-ghost:hover { background:#ece5ff; }
+  /* режим отрезка от предыдущей точки: авто / всегда дорога / всегда прямая */
+  .mpt-seg { display:flex; gap:4px; margin-top:3px; }
+  .mpt-seg button { flex:1; font:inherit; font-size:12px; padding:6px 4px; cursor:pointer;
+                    background:#fff; color:#444; border:1px solid #ccc; border-radius:8px; }
+  .mpt-seg button:hover { background:#f4f4f4; }
+  .mpt-seg button.on { background:#7c4dff; color:#fff; border-color:#6a3de8; font-weight:600; }
   .track-status { font-size:12px; color:#666; }
   .rec-dot { display:inline-block; width:9px; height:9px; border-radius:50%; background:#2e7d32;
              margin-right:5px; animation:pulse 1.6s infinite; }
@@ -242,7 +250,7 @@
 //  этот файл трогать не нужно. Координаты в JSON: [широта, долгота].
 // ============================================================================
 
-console.log('viettrip build: point-ids v7');   // маркер версии — видно в консоли, если файл свежий
+console.log('viettrip build: point-edit v8');   // маркер версии — видно в консоли, если файл свежий
 
 // ---- Карта (слои) ----
 const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -347,26 +355,63 @@ async function fetchRoute(coords){
 // Быстрый строковый хэш (djb2) — ключи для кэша дорог в localStorage.
 function hashStr(s){ let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0; return (h >>> 0).toString(36); }
 
+// Расстояние по прямой между [lat,lng], метры (гаверсинус).
+function distM(a, b){
+  const R = 6371000, r = x => x * Math.PI / 180;
+  const dLa = r(b[0] - a[0]), dLo = r(b[1] - a[1]);
+  const h = Math.sin(dLa/2)**2 + Math.cos(r(a[0])) * Math.cos(r(b[0])) * Math.sin(dLo/2)**2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
 // Прореживаем очень длинный путь: не заваливаем публичный OSRM запросами,
-// дороги между точками всё равно строит сам роутер.
+// дороги между точками всё равно строит сам роутер. Точки, задающие принудительный
+// режим отрезка (edge), и их соседей не выбрасываем — иначе потеряется указание владельца.
 function thinPoints(pts, cap){
   if (pts.length <= cap) return pts;
   const step = Math.ceil(pts.length / cap), out = [];
-  for (let i = 0; i < pts.length; i += step) out.push(pts[i]);
+  for (let i = 0; i < pts.length; i++){
+    if (i % step === 0 || pts[i].edge || (pts[i+1] && pts[i+1].edge)) out.push(pts[i]);
+  }
   if (out[out.length - 1] !== pts[pts.length - 1]) out.push(pts[pts.length - 1]);
   return out;
 }
 
-// Проложить дороги через последовательность точек. Возвращает { line, retry }.
+// ---- Отрезки пути: по дорогам или прямой ----
+// Отрезок = пара соседних точек. Режим берём из edge ПРАВОЙ точки:
+//   'straight' — прямая, OSRM даже не спрашиваем (бездорожье, тропа, паром)
+//   'road'     — по дорогам, что бы роутер ни выдал
+//   иначе      — авто: ведём по дорогам, но если роутер накрутил крюк (втрое длиннее
+//                прямой + запас), считаем, что точка не на дороге, и рисуем прямую.
+const DETOUR_RATIO = 3;      // во сколько раз объезд должен превысить прямую…
+const DETOUR_MIN_M = 400;    // …и на сколько метров, чтобы признать его «крюком»
+
+function straightSeg(a, b){ return { road:false, line:[[a.lat,a.lng],[b.lat,b.lng]] }; }
+function straightSegs(pts){
+  const out = [];
+  for (let i = 1; i < pts.length; i++) out.push(straightSeg(pts[i-1], pts[i]));
+  return out;
+}
+// Геометрия «ноги» маршрута (между двумя нашими точками) = склейка геометрий её шагов:
+// per-leg геометрию OSRM отдаёт только в steps, а нам нужен именно отрезок, а не весь путь.
+function legLine(leg){
+  const line = [];
+  (leg.steps || []).forEach(st => {
+    const c = (st.geometry && st.geometry.coordinates) || [];
+    c.forEach((p, i) => { if (i === 0 && line.length) return; line.push([p[1], p[0]]); });
+  });
+  return line;
+}
+
+// Проложить дороги через последовательность точек. Возвращает { segs, retry }.
 // Если /route не построил маршрут (между какой-то парой точек нет дороги — фото
 // снято над лагуной, оторванный GPS-фикс и т.п.), НЕ бракуем весь участок: делим
 // пополам и повторяем, чтобы «прямой» осталась только реально непроходимая пара.
 //   retry=true  → временная ошибка (429/сеть) — результат не кэшируем, повторим позже
 //   retry=false → окончательно (либо дороги, либо честная прямая на непроходимом куске)
 async function routeSpan(pts){
-  if (pts.length < 2) return { line: pts.map(p => [p.lat, p.lng]), retry: false };
+  if (pts.length < 2) return { segs: [], retry: false };
   const coords = pts.map(p => `${p.lng},${p.lat}`).join(';');
-  const url = `https://router.project-osrm.org/route/v1/driving/${coords}?overview=full&geometries=geojson`;
+  const url = `https://router.project-osrm.org/route/v1/driving/${coords}?overview=false&geometries=geojson&steps=true`;
   let data;
   try{
     const res = await osrmFetch(url);
@@ -375,36 +420,79 @@ async function routeSpan(pts){
     // {code:"NoRoute"} — это ПОСТОЯННАЯ ситуация, её надо изолировать делением (ниже), а не
     // ретраить. Раньше здесь стоял `if(!res.ok)`, и один непроходимый стык (напр. оторванный
     // GPS-фикс над морем) превращал весь 90-точечный чанк в прямую навсегда.
-    if (res.status === 429 || res.status >= 500) return { line: pts.map(p => [p.lat, p.lng]), retry: true };
+    if (res.status === 429 || res.status >= 500) return { segs: straightSegs(pts), retry: true };
     data = await res.json();                    // OSRM отдаёт JSON и на 400 (тело с code)
   }catch(e){
-    return { line: pts.map(p => [p.lat, p.lng]), retry: true };                // сеть/JSON — повторим позже
+    return { segs: straightSegs(pts), retry: true };                          // сеть/JSON — повторим позже
   }
-  if (data && data.code === 'Ok' && data.routes && data.routes[0]){
-    const line = data.routes[0].geometry.coordinates.map(c => [c[1], c[0]]);
-    if (line.length >= 2) return { line, retry: false };
+  const legs = (data && data.code === 'Ok' && data.routes && data.routes[0] && data.routes[0].legs) || null;
+  if (legs && legs.length === pts.length - 1){
+    const segs = [];
+    for (let i = 0; i < legs.length; i++){
+      const a = pts[i], b = pts[i+1];
+      const line = legLine(legs[i]);
+      const crow = distM([a.lat, a.lng], [b.lat, b.lng]);
+      const detour = b.edge !== 'road' && legs[i].distance > crow * DETOUR_RATIO + DETOUR_MIN_M;
+      segs.push(line.length >= 2 && !detour ? { road:true, line } : straightSeg(a, b));
+    }
+    return { segs, retry: false };
   }
   // Сервер ответил (200 code!=Ok ЛИБО 400 NoRoute), но между какими-то точками дороги нет
-  if (pts.length === 2) return { line: pts.map(p => [p.lat, p.lng]), retry: false };  // непроходимая пара — прямая, окончательно
-  const mid = pts.length >> 1;                                                         // делим и изолируем проблемный участок
+  if (pts.length === 2) return { segs: [straightSeg(pts[0], pts[1])], retry: false };   // непроходимая пара — прямая, окончательно
+  const mid = pts.length >> 1;                                                          // делим и изолируем проблемный участок
   const [a, b] = await Promise.all([ routeSpan(pts.slice(0, mid + 1)), routeSpan(pts.slice(mid)) ]);
-  return { line: a.line.concat(b.line.slice(1)), retry: a.retry || b.retry };
+  return { segs: a.segs.concat(b.segs), retry: a.retry || b.retry };
 }
 
 async function roadsThrough(points){
   points = thinPoints(points, 900);
-  const MAX = 90, chunks = [];
-  for (let i = 0; i < points.length; i += MAX - 1){   // нахлёст в 1 точку, чтобы чанки стыковались
-    chunks.push(points.slice(i, i + MAX));
-    if (i + MAX >= points.length) break;
+  if (points.length < 2) return { segs: [], ok: true };
+  // Принудительные прямые режут трек на «дорожные» участки — их OSRM не видит вовсе.
+  const tasks = [];                                  // по порядку: {run:[…точки]} | {straight:[a,b]}
+  let run = [points[0]];
+  for (let i = 1; i < points.length; i++){
+    const p = points[i];
+    if (p.edge === 'straight'){
+      if (run.length > 1) tasks.push({ run });
+      tasks.push({ straight: [points[i-1], p] });
+      run = [p];
+    } else run.push(p);
   }
-  const parts = await Promise.all(chunks.map(routeSpan));   // все чанки — параллельно, порядок держит Promise.all
-  const line = []; let retry = false;
-  parts.forEach((part, idx) => {
-    (idx ? part.line.slice(1) : part.line).forEach(c => line.push(c));   // idx>0: снять стыковую точку-нахлёст
-    if (part.retry) retry = true;
-  });
-  return { line, ok: !retry };   // ok=true → результат окончательный, можно кэшировать
+  if (run.length > 1) tasks.push({ run });
+
+  const parts = await Promise.all(tasks.map(async task => {
+    if (task.straight) return { segs: [straightSeg(task.straight[0], task.straight[1])], retry: false };
+    const pts = task.run, MAX = 90, chunks = [];
+    for (let i = 0; i < pts.length; i += MAX - 1){    // нахлёст в 1 точку, чтобы чанки стыковались
+      chunks.push(pts.slice(i, i + MAX));
+      if (i + MAX >= pts.length) break;
+    }
+    const done = await Promise.all(chunks.map(routeSpan));   // чанки — параллельно, порядок держит Promise.all
+    return { segs: done.reduce((acc, c) => acc.concat(c.segs), []),
+             retry: done.some(c => c.retry) };
+  }));
+  return { segs: parts.reduce((acc, p) => acc.concat(p.segs), []),
+           ok: !parts.some(p => p.retry) };          // ok=true → окончательно, можно кэшировать
+}
+
+// Отрезки → две ломаные: дороги (сплошная) и прямые (пунктир). Соседние однотипные
+// отрезки склеиваем; на стыке типов дублируем точку стыка, иначе между снапнутой к
+// дороге геометрией и сырой координатой точки виден разрыв.
+function segLines(segs){
+  const road = [], straight = [];
+  let cur = null, kind = null, lastPt = null;
+  for (const s of segs){
+    const k = s.road ? 'road' : 'straight';
+    if (k !== kind){
+      cur = [];
+      (k === 'road' ? road : straight).push(cur);
+      if (lastPt) cur.push(lastPt);
+      s.line.forEach(c => cur.push(c));
+      kind = k;
+    } else s.line.slice(1).forEach(c => cur.push(c));
+    lastPt = cur[cur.length - 1];
+  }
+  return { road, straight };
 }
 
 function metaText(d){
@@ -920,55 +1008,60 @@ function installPhotos(trackKey){
 
   const statusEl = document.getElementById('trackStatus');
   function setStatus(html){ statusEl.innerHTML = html || ''; }
-  function distM(a, b){
-    const R=6371000, r=x=>x*Math.PI/180;
-    const dLa=r(b[0]-a[0]), dLo=r(b[1]-a[1]);
-    const h=Math.sin(dLa/2)**2 + Math.cos(r(a[0]))*Math.cos(r(b[0]))*Math.sin(dLo/2)**2;
-    return 2*R*Math.asin(Math.sqrt(h));
-  }
 
   // --- Отрисовка записанного трека (тёмная линия + точки + «последняя точка») ---
-  let trailLine=null, trailHead=null, trailDots=[], trailGen=0;
+  // Линий две: сплошная (участки по дорогам) и пунктирная (прямые — бездорожье либо
+  // отрезок, где роутер предложил абсурдный крюк). Пока дороги строятся, показываем
+  // сырой пунктир по точкам.
+  let trailLine=null, trailRoad=null, trailStraight=null, trailHead=null, trailDots=[], trailGen=0;
   let trailPoints=[];                          // сырой трек из /api/trail
   let lastDrawnKey=null;                        // подпись отрисованного пути — чтобы не перерисовывать зря
-  const roadCache={ key:null, line:null };      // кэш дорог в памяти (переживает 30-сек. поллинг)
+  const roadCache={ key:null, lines:null };     // кэш дорог в памяти (переживает 30-сек. поллинг)
 
-  // Подпись набора точек → ключ кэша
+  // Подпись набора точек → ключ кэша (режим отрезка меняет геометрию — тоже в ключ)
   function pointsKey(pts){
-    return hashStr(pts.map(p => `${p.lat.toFixed(5)},${p.lng.toFixed(5)},${p.t||0}`).join(';'));
+    return hashStr(pts.map(p => `${p.lat.toFixed(5)},${p.lng.toFixed(5)},${p.t||0},${p.edge||''}`).join(';'));
   }
-  // Кэш дорог трека в localStorage. Префикс c версией (…:v2:) — чтобы отбросить
-  // старые записи прошлого алгоритма (/match мог закэшировать прямые). Держим только
-  // актуальный ключ: трек растёт, старое не нужно; заодно чистим устаревшие префиксы.
-  const TRAIL_NS = 'viettrip:trail:v4:';
+  // Кэш дорог трека в localStorage. Префикс c версией (…:v5:) — чтобы отбросить
+  // старые записи прошлого алгоритма (там кэшировалась одна ломаная, без деления на
+  // дороги/прямые). Держим только актуальный ключ: трек растёт, старое не нужно.
+  const TRAIL_NS = 'viettrip:trail:v5:';
   function loadTrailRoads(key){
-    try{ const v=localStorage.getItem(TRAIL_NS+key); return v?JSON.parse(v):null; }catch(e){ return null; }
+    try{
+      const v = JSON.parse(localStorage.getItem(TRAIL_NS+key) || 'null');
+      return (v && Array.isArray(v.road) && Array.isArray(v.straight)) ? v : null;
+    }catch(e){ return null; }
   }
-  function saveTrailRoads(key, line){
+  function saveTrailRoads(key, lines){
     try{
       for (let i=localStorage.length-1;i>=0;i--){
         const k=localStorage.key(i);
-        if(k && k.startsWith('viettrip:trail:') && k!==TRAIL_NS+key) localStorage.removeItem(k);   // и старый префикс без версии
+        if(k && k.startsWith('viettrip:trail:') && k!==TRAIL_NS+key) localStorage.removeItem(k);   // и старые префиксы
       }
-      localStorage.setItem(TRAIL_NS+key, JSON.stringify(line));
+      localStorage.setItem(TRAIL_NS+key, JSON.stringify(lines));
     }catch(e){ /* переполнение хранилища — не критично */ }
   }
 
   // Пройденный путь = ТОЛЬКО точки трека (/api/trail), упорядоченные по времени.
   // Координаты фотографий перенесены в трек отдельными точками (src:'photo') разово,
   // на самих фото путь больше не завязан — что видно точками, то и строит линию:
-  // каждую точку можно подвинуть или удалить по её id.
+  // каждую точку можно подвинуть, удалить или задать ей режим отрезка по её id.
   function traveledPoints(){
     return (trailPoints||[])
       .filter(p => isFinite(p.lat) && isFinite(p.lng))
-      .map(p => ({ id:p.id, lat:p.lat, lng:p.lng, t:p.t||0, acc:p.acc, src:p.src, photo:p.photo }))
+      .map(p => ({ id:p.id, lat:p.lat, lng:p.lng, t:p.t||0, acc:p.acc, src:p.src, photo:p.photo, edge:p.edge }))
       .sort((a,b) => a.t - b.t);
   }
 
-  function applyRoadLine(line, gen){
-    if (gen!==trailGen || !trailLine || !line || line.length<2) return;
-    trailLine.setLatLngs(line);
-    trailLine.setStyle({ dashArray:null });          // сплошная = едем по дорогам
+  function applyRoadLine(lines, gen){
+    if (gen!==trailGen || !lines) return;
+    if (trailLine){ map.removeLayer(trailLine); trailLine=null; }                    // сырой пунктир больше не нужен
+    if (trailRoad){ map.removeLayer(trailRoad); trailRoad=null; }
+    if (trailStraight){ map.removeLayer(trailStraight); trailStraight=null; }
+    if (lines.road.length)
+      trailRoad = L.polyline(lines.road, { color:'#111', weight:3, opacity:.6 }).addTo(map);
+    if (lines.straight.length)                                                       // прямая = дороги нет
+      trailStraight = L.polyline(lines.straight, { color:'#111', weight:3, opacity:.6, dashArray:'4,6' }).addTo(map);
   }
 
   // --- Точки-«хлебные крошки» ---
@@ -985,7 +1078,7 @@ function installPhotos(trackKey){
         body: JSON.stringify(body) });
       if (!r.ok){ setStatus('<span style="color:#b00020">не удалось изменить точку</span>'); return false; }
       const src = trailPoints.find(x => x.id === p.id);
-      if (src) Object.assign(src, body);
+      if (src){ Object.assign(src, body); if (src.edge === 'auto') delete src.edge; }   // авто = поля нет (как на сервере)
       map.closePopup(); lastDrawnKey = null; redrawTraveled();
       setStatus(`<span style="color:#0a7">${p.id} обновлена ✓</span>`);
       return true;
@@ -1004,16 +1097,38 @@ function installPhotos(trackKey){
   }
 
   function ownerPointPopup(p){
+    const pts = traveledPoints(), i = pts.findIndex(x => x.id === p.id);
+    const prev = i > 0 ? pts[i-1] : null, next = (i >= 0 && i < pts.length-1) ? pts[i+1] : null;
+    const edge = p.edge || 'auto';
     const div = document.createElement('div'); div.className = 'navpop';
     div.innerHTML =
       `<div class="navpop-title">Точка <b>${p.id||'—'}</b> · ${SRC_LABEL[p.src] || p.src || '—'}</div>` +
       `<div class="navpop-coord">${fmtTime(p.t)}<br>${r6(p.lat)}, ${r6(p.lng)}</div>` +
+      // Вставка соседа: время посчитает сервер (середина промежутка), поэтому точка
+      // гарантированно ляжет между этой и соседней, а не куда-нибудь по таймстампу.
+      `<label class="mpt-lbl">Добавить точку рядом</label>` +
+      `<div class="mpt-row">` +
+        `<button class="mpt-btn mpt-ghost" data-ins="before"${prev ? '' : ' title="в начало трека"'}>➕ до${prev ? ' (после '+prev.id+')' : ''}</button>` +
+        `<button class="mpt-btn mpt-ghost" data-ins="after">➕ после${next ? ' (до '+next.id+')' : ' (в конец)'}</button>` +
+      `</div>` +
+      (prev
+        ? `<label class="mpt-lbl">Отрезок от ${prev.id}</label>` +
+          `<div class="mpt-seg">` +
+            `<button data-edge="auto"${edge==='auto'?' class="on"':''}>авто</button>` +
+            `<button data-edge="road"${edge==='road'?' class="on"':''}>дорога</button>` +
+            `<button data-edge="straight"${edge==='straight'?' class="on"':''}>прямая</button>` +
+          `</div>`
+        : '') +
       `<label class="mpt-lbl">Дата и время</label>` +
       `<input type="datetime-local" class="mpt-dt" value="${toLocalInput(p.t || 0)}">` +
       `<div class="mpt-row">` +
         `<button class="mpt-btn mpt-cancel">🗑 Удалить</button>` +
         `<button class="mpt-btn mpt-add">Сохранить</button></div>` +
       `<div class="mpt-hint">Перетащите точку, чтобы подвинуть</div>`;
+    div.querySelectorAll('[data-ins]').forEach(b =>
+      b.addEventListener('click', () => setAddMode(true, p, b.dataset.ins)));
+    div.querySelectorAll('[data-edge]').forEach(b =>
+      b.addEventListener('click', () => { if (b.dataset.edge !== edge) patchPoint(p, { edge: b.dataset.edge }); else map.closePopup(); }));
     div.querySelector('.mpt-cancel').addEventListener('click', () => deletePoint(p));
     div.querySelector('.mpt-add').addEventListener('click', () => {
       const v = div.querySelector('.mpt-dt').value;
@@ -1034,15 +1149,16 @@ function installPhotos(trackKey){
       const ll = e.target.getLatLng();
       patchPoint(p, { lat:+ll.lat.toFixed(6), lng:+ll.lng.toFixed(6) });
     });
-    m.bindPopup(() => ownerPointPopup(p), { maxWidth:260 });
-    m.bindTooltip(p.id || '', { direction:'top', offset:[0,-6] });
+    m.bindPopup(() => ownerPointPopup(p), { maxWidth:270 });
+    m.bindTooltip(p.id + (p.edge ? (p.edge === 'straight' ? ' · прямая' : ' · дорога') : ''),
+                  { direction:'top', offset:[0,-6] });
     return m;
   }
 
   function drawTrail(points){
     const gen = ++trailGen;
-    if (trailLine){ map.removeLayer(trailLine); trailLine=null; }
-    if (trailHead){ map.removeLayer(trailHead); trailHead=null; }
+    [trailLine, trailRoad, trailStraight, trailHead].forEach(l => { if (l) map.removeLayer(l); });
+    trailLine = trailRoad = trailStraight = trailHead = null;
     trailDots.forEach(m=>map.removeLayer(m)); trailDots=[];
     if (!points || !points.length) return;
     const ll = points.map(p=>[p.lat,p.lng]);
@@ -1058,13 +1174,14 @@ function installPhotos(trackKey){
 
     // …затем дороги: сперва кэш (память → localStorage), иначе строим маршрут и кэшируем
     const key = pointsKey(points);
-    if (roadCache.key===key && roadCache.line){ applyRoadLine(roadCache.line, gen); return; }
+    if (roadCache.key===key && roadCache.lines){ applyRoadLine(roadCache.lines, gen); return; }
     const cached = loadTrailRoads(key);
-    if (cached && cached.length>=2){ roadCache.key=key; roadCache.line=cached; applyRoadLine(cached, gen); return; }
+    if (cached){ roadCache.key=key; roadCache.lines=cached; applyRoadLine(cached, gen); return; }
     roadsThrough(points).then(r => {
-      if (gen!==trailGen || !r.line || r.line.length<2) return;
-      applyRoadLine(r.line, gen);                    // показываем что построилось
-      if (r.ok){ roadCache.key=key; roadCache.line=r.line; saveTrailRoads(key, r.line); }  // кэшируем ТОЛЬКО реальные дороги
+      if (gen!==trailGen || !r.segs || !r.segs.length) return;
+      const lines = segLines(r.segs);
+      applyRoadLine(lines, gen);                     // показываем что построилось
+      if (r.ok){ roadCache.key=key; roadCache.lines=lines; saveTrailRoads(key, lines); }  // кэшируем ТОЛЬКО окончательный результат
     }).catch(()=>{ /* маршрут не построился — остаётся сырая линия, повторим на следующем redraw */ });
   }
 
@@ -1153,63 +1270,89 @@ function installPhotos(trackKey){
     }, { enableHighAccuracy:true, maximumAge:5000, timeout:20000 });
   }
 
-  // ================= Ручное добавление точек трека (владелец) =================
-  // Забыл открыть страницу с ключом → трек не писался. Здесь можно достроить его:
-  // тапнуть по карте, задать дату-время — точка ляжет в трек (POST /api/point) и
-  // попадёт в пройденный путь наравне с GPS-фиксами и точками из фото.
-  let addMode = false;
-  let lastManualT = Math.floor(Date.now() / 1000);   // «память» времени: следующая точка +1 мин
-  const addHint = '<span class="rec-dot" style="background:#7c4dff"></span>тапайте карту, чтобы добавить точку';
+  // ============ Добавление точек трека: «продолжаем от точки pN» (владелец) ============
+  // Точку всегда ставим ОТНОСИТЕЛЬНО существующей — так видно, продолжением какой она
+  // является, и она не улетает не туда из-за времени. Якорь подсвечен кольцом, отрезок,
+  // в который она встанет, — фиолетовым пунктиром. Время считает сервер (середина
+  // промежутка между якорем и его соседом). После добавления якорем становится новая
+  // точка: тапая дальше, рисуем цепочку вдоль дороги.
+  let addMode = false, anchorId = null, anchorSide = 'after';
+  let anchorRing = null, anchorSeg = null;
 
   function toLocalInput(sec){                          // epoch → значение для <input datetime-local> (локальное время)
     const d = new Date(sec * 1000), p = n => String(n).padStart(2, '0');
     return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
   }
 
-  function openAddForm(ll){
-    const lat = +ll.lat.toFixed(6), lng = +ll.lng.toFixed(6);
-    const div = document.createElement('div'); div.className = 'navpop';
-    div.innerHTML =
-      `<div class="navpop-title">Новая точка трека</div>` +
-      `<div class="navpop-coord">${lat}, ${lng}</div>` +
-      `<label class="mpt-lbl">Дата и время</label>` +
-      `<input type="datetime-local" class="mpt-dt" value="${toLocalInput(lastManualT + 60)}">` +
-      `<div class="mpt-row">` +
-        `<button class="mpt-btn mpt-cancel">Отмена</button>` +
-        `<button class="mpt-btn mpt-add">Добавить</button></div>`;
-    const pop = L.popup({ maxWidth:260, autoClose:false, closeOnClick:false })
-                 .setLatLng(ll).setContent(div).openOn(map);
-    div.querySelector('.mpt-cancel').addEventListener('click', () => map.closePopup(pop));
-    div.querySelector('.mpt-add').addEventListener('click', async () => {
-      const v = div.querySelector('.mpt-dt').value;
-      const t = v ? Math.floor(new Date(v).getTime() / 1000) : Math.floor(Date.now() / 1000);
-      if (!isFinite(t) || t <= 0){ setStatus('<span style="color:#b00020">неверная дата</span>'); return; }
-      const btn = div.querySelector('.mpt-add'); btn.disabled = true; btn.textContent = '…';
-      try{
-        const r = await fetch('/api/point', { method:'POST',
-          headers:{ 'Content-Type':'application/json', 'X-Trip-Key':TRACK_KEY },
-          body: JSON.stringify({ lat, lng, t }) });
-        if (r.status === 401){ setStatus('<span style="color:#b00020">неверный ключ записи</span>'); btn.disabled = false; btn.textContent = 'Добавить'; return; }
-        const j = await r.json().catch(() => ({}));
-        if (r.ok && j.id){
-          trailPoints.push({ lat, lng, t, id:j.id, src:'manual' });
-          lastManualT = t; lastDrawnKey = null;
-          map.closePopup(pop); redrawTraveled();
-          setStatus('<span style="color:#0a7">точка добавлена ✓</span>');
-          setTimeout(() => { if (addMode) setStatus(addHint); }, 1200);
-        } else { setStatus('<span style="color:#b00020">не удалось добавить точку</span>'); btn.disabled = false; btn.textContent = 'Добавить'; }
-      }catch(e){ setStatus('<span style="color:#b00020">нет связи с сервером</span>'); btn.disabled = false; btn.textContent = 'Добавить'; }
-    });
+  // Куда именно ляжет следующая точка: якорь + сосед с нужной стороны
+  function anchorInfo(){
+    const pts = traveledPoints();
+    if (!pts.length) return null;
+    const i = anchorId ? pts.findIndex(p => p.id === anchorId) : pts.length - 1;
+    if (i < 0) return null;
+    return { cur: pts[i], nb: anchorSide === 'after' ? (pts[i+1] || null) : (i ? pts[i-1] : null) };
   }
 
-  function setAddMode(on){
+  function showAnchor(){
+    if (anchorRing){ map.removeLayer(anchorRing); anchorRing = null; }
+    if (anchorSeg){ map.removeLayer(anchorSeg); anchorSeg = null; }
+    if (!addMode) return;
+    const a = anchorInfo();
+    if (!a){                                            // трек пуст — первая точка ставится «сейчас»
+      setStatus('<span class="rec-dot" style="background:#7c4dff"></span>тапните карту — это будет первая точка трека');
+      return;
+    }
+    anchorRing = L.circleMarker([a.cur.lat, a.cur.lng],
+      { radius:11, color:'#7c4dff', weight:3, fill:false, interactive:false }).addTo(map);
+    if (a.nb) anchorSeg = L.polyline([[a.cur.lat,a.cur.lng],[a.nb.lat,a.nb.lng]],
+      { color:'#7c4dff', weight:6, opacity:.45, dashArray:'6,8', interactive:false }).addTo(map);
+    const where = anchorSide === 'after'
+      ? (a.nb ? `между <b>${a.cur.id}</b> и <b>${a.nb.id}</b>` : `после <b>${a.cur.id}</b> (в конец трека)`)
+      : (a.nb ? `между <b>${a.nb.id}</b> и <b>${a.cur.id}</b>` : `перед <b>${a.cur.id}</b> (в начало трека)`);
+    setStatus(`<span class="rec-dot" style="background:#7c4dff"></span>тапайте карту — точка ляжет ${where}`);
+  }
+
+  async function addPointAt(ll){
+    const a = anchorInfo();
+    const lat = +ll.lat.toFixed(6), lng = +ll.lng.toFixed(6);
+    const body = a ? { lat, lng, [anchorSide]: a.cur.id }
+                   : { lat, lng, t: Math.floor(Date.now() / 1000) };
+    try{
+      const r = await fetch('/api/point', { method:'POST',
+        headers:{ 'Content-Type':'application/json', 'X-Trip-Key':TRACK_KEY },
+        body: JSON.stringify(body) });
+      if (r.status === 401){ setStatus('<span style="color:#b00020">неверный ключ записи</span>'); return; }
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || !j.point){ setStatus('<span style="color:#b00020">не удалось добавить точку</span>'); return; }
+      const i = a ? trailPoints.findIndex(p => p.id === a.cur.id) : -1;   // держим локальный трек в порядке сервера
+      if (i >= 0) trailPoints.splice(anchorSide === 'after' ? i + 1 : i, 0, j.point);
+      else trailPoints.push(j.point);
+      anchorId = j.point.id; anchorSide = 'after';      // следующая пойдёт за только что поставленной
+      lastDrawnKey = null; redrawTraveled(); showAnchor();
+    }catch(e){ setStatus('<span style="color:#b00020">нет связи с сервером</span>'); }
+  }
+
+  // anchor/side — из попапа точки («➕ до/после»); без них продолжаем конец трека
+  function setAddMode(on, anchor, side){
     addMode = on;
-    pointPlaceCb = on ? openAddForm : null;
+    if (on){
+      anchorSide = side || 'after';
+      anchorId = anchor ? anchor.id : (anchorId || null);
+      if (!anchor && !anchorId){
+        const pts = traveledPoints();
+        anchorId = pts.length ? pts[pts.length-1].id : null;
+      }
+    } else { anchorId = null; anchorSide = 'after'; }
+    pointPlaceCb = on ? addPointAt : null;
     const btn = document.getElementById('pointBtn');
     if (btn){ btn.classList.toggle('active', on); btn.textContent = on ? '✓ Готово' : '➕ Точка'; }
     document.getElementById('map').style.cursor = on ? 'crosshair' : '';
-    if (on) setStatus(addHint); else { map.closePopup(); if (!TRACK_KEY) setStatus(''); }
+    map.closePopup();
+    showAnchor();
+    if (!on) setStatus('');
   }
+
+  document.addEventListener('keydown', e => { if (e.key === 'Escape' && addMode) setAddMode(false); });
 
   // Разовый перенос координат фото в трек (идемпотентно; поездка кончилась — новых фото нет).
   // После него фотографии остаются на карте, но путь строится только по точкам трека.

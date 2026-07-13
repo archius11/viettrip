@@ -8,12 +8,19 @@
   photo  — координата фотографии, перенесённая в трек (/api/import-photos)
 На id можно ссылаться (в т.ч. вербально: «убери p137») — они не переиспользуются.
 
+У точки есть необязательное поле edge — как рисовать отрезок ОТ ПРЕДЫДУЩЕЙ точки к ней:
+  auto (по умолчанию, поля нет) — вести по дорогам, но если роутер выдал крюк втрое
+       длиннее прямой, фронт сам рисует прямую (точка не на дороге)
+  road     — всегда по дорогам   |   straight — всегда прямая (бездорожье, паром, тропа)
+
 Маршруты:
-  GET    /api/trail          -> {"points":[{id,lat,lng,t,src,acc?,photo?}...], "updated":ts}  (публично)
+  GET    /api/trail          -> {"points":[{id,lat,lng,t,src,acc?,photo?,edge?}...], "updated":ts}  (публично)
   GET    /api/health         -> {"ok":true}
   POST   /api/ping           -> точка живого трека. Тело {lat,lng,acc?}. Заголовок X-Trip-Key
-  POST   /api/point          -> точка вручную. Тело {lat,lng,t?}. Вставляется в трек по времени
-  PATCH  /api/point?id=pN    -> подвинуть/переставить во времени. Тело {lat?,lng?,t?}
+  POST   /api/point          -> точка вручную. Тело {lat,lng,after?:"pN"|before?:"pN"|t?,edge?}.
+                                С якорем (after/before) время считает сервер — середина
+                                промежутка с соседом, точка гарантированно встаёт между ними
+  PATCH  /api/point?id=pN    -> подвинуть/переставить во времени/сменить edge. Тело {lat?,lng?,t?,edge?}
   DELETE /api/point?id=pN    -> удалить любую точку трека
   POST   /api/import-photos  -> перенести координаты всех фото в трек точками src=photo.
                                 Идемпотентно: уже перенесённые (по photo=<id фото>) пропускаются
@@ -43,6 +50,7 @@ MAX_IMG_BYTES  = 8 * 1024 * 1024    # предел на один декодир�
 MAX_PHOTOS     = 2000               # предел числа фото (защита диска)
 PHOTO_ID_RE    = re.compile(r"^[0-9]+_[0-9a-f]+$")   # id фото (исторический формат)
 POINT_ID_RE    = re.compile(r"^p[0-9]+$")            # id точки трека — короткий, произносимый
+EDGE_MODES     = ("auto", "road", "straight")        # отрезок от предыдущей точки к этой
 
 _lock = threading.Lock()
 
@@ -102,6 +110,16 @@ def _dist_m(a, b):
     la1, lo1, la2, lo2 = map(radians, (a[0], a[1], b[0], b[1]))
     h = sin((la2 - la1) / 2) ** 2 + cos(la1) * cos(la2) * sin((lo2 - lo1) / 2) ** 2
     return 2 * 6371000 * asin(sqrt(h))
+
+
+def _between(a, b, step):
+    """Время точки, вставляемой рядом с якорем: середина промежутка до соседа b.
+    Соседа нет (якорь крайний) → отступаем на step секунд. Промежуток может быть
+    любым (хоть 1 с) — время дробное, места между двумя точками хватит всегда."""
+    if b is None:
+        return round(a + step, 3)
+    mid = round((a + b) / 2.0, 3)
+    return int(mid) if float(mid).is_integer() else mid
 
 
 def _insert_point(d, pt):
@@ -269,34 +287,84 @@ class Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _stamp(t):
-        t = int(t)
+        t = float(t)
         if not (0 < t < 4102444800):            # 1970 < t < 2100 — отсекаем мусор
             raise ValueError("t")
-        return t
+        return int(t) if t.is_integer() else round(t, 3)   # дробные секунды — для вставок между соседями
+
+    @staticmethod
+    def _edge(body):
+        e = body.get("edge")
+        if e is None:
+            return None
+        if e not in EDGE_MODES:
+            raise ValueError("edge")
+        return e
+
+    @staticmethod
+    def _anchor(body, key):
+        a = body.get(key)
+        if a is None:
+            return None
+        if not POINT_ID_RE.match(str(a)):
+            raise ValueError(key)
+        return a
 
     def _point_post(self):
-        """Ручная точка трека: {lat,lng,t?}. t — Unix-секунды (если нет — сейчас).
-        Вставляется в трек по времени, src=manual."""
+        """Ручная точка трека: {lat, lng, after?:"pN" | before?:"pN" | t?, edge?}.
+
+        Якорь (after/before) — главный способ: точка встаёт прямо за/перед указанной,
+        а время ей считает сервер (середина промежутка с соседом). Так понятно,
+        продолжением какой точки она является, и она не улетает в конец трека из-за
+        неверно набранного времени. Без якоря — по времени t (по умолчанию «сейчас»).
+        src=manual."""
         if not self._authed():
             return self._send(401, {"error": "bad key"})
         try:
             body = self._body()
             lat, lng = self._coords(body)
-            t = self._stamp(body["t"]) if body.get("t") is not None else int(time.time())
+            after = self._anchor(body, "after")
+            before = self._anchor(body, "before")
+            edge = self._edge(body)
+            t = self._stamp(body["t"]) if body.get("t") is not None else None
         except Exception:
             return self._send(400, {"error": "bad body"})
 
         with _lock:
             d = _load()
+            pts = d["points"]
+            idx = None
+            if after or before:
+                aid = after or before
+                i = next((k for k, p in enumerate(pts) if p.get("id") == aid), None)
+                if i is None:
+                    return self._send(404, {"error": "anchor not found"})
+                if after:
+                    nb = pts[i + 1].get("t") if i + 1 < len(pts) else None
+                    idx, t = i + 1, _between(pts[i].get("t", 0), nb, 60)
+                else:
+                    nb = pts[i - 1].get("t") if i > 0 else None
+                    idx, t = i, _between(pts[i].get("t", 0), nb, -60)
+            if t is None:
+                t = int(time.time())
             pt = {"id": _next_id(d), "lat": lat, "lng": lng, "t": t, "src": "manual"}
-            _insert_point(d, pt)
+            if edge and edge != "auto":
+                pt["edge"] = edge
+            if idx is None:
+                _insert_point(d, pt)            # без якоря — по времени
+            else:
+                pts.insert(idx, pt)             # с якорем — ровно туда, куда просили
+                if len(pts) > MAX_POINTS:
+                    d["points"] = pts[-MAX_POINTS:]
             d["updated"] = int(time.time())
             _save(d)
-            return self._send(200, {"ok": True, "id": pt["id"], "points": len(d["points"])})
+            return self._send(200, {"ok": True, "id": pt["id"], "point": pt,
+                                    "points": len(d["points"])})
 
     def _point_patch(self):
-        """Правка точки по id: {lat?,lng?,t?}. Двигаем по карте и/или переставляем во
-        времени (порядок трека = порядок по t, поэтому при смене t переставляем точку)."""
+        """Правка точки по id: {lat?,lng?,t?,edge?}. Двигаем по карте, переставляем во
+        времени (порядок трека = порядок по t, поэтому при смене t переставляем точку)
+        и/или меняем режим отрезка от предыдущей точки (auto|road|straight)."""
         if not self._authed():
             return self._send(401, {"error": "bad key"})
         pid = (parse_qs(urlparse(self.path).query).get("id") or [""])[0]
@@ -307,7 +375,8 @@ class Handler(BaseHTTPRequestHandler):
             move = ("lat" in body or "lng" in body)
             lat, lng = self._coords(body) if move else (None, None)
             t = self._stamp(body["t"]) if body.get("t") is not None else None
-            if not move and t is None:
+            edge = self._edge(body)
+            if not move and t is None and edge is None:
                 raise ValueError("empty")
         except Exception:
             return self._send(400, {"error": "bad body"})
@@ -320,6 +389,11 @@ class Handler(BaseHTTPRequestHandler):
             if move:
                 pt["lat"] = lat; pt["lng"] = lng
                 pt.pop("acc", None)             # координата уже не «замер GPS с точностью N м»
+            if edge is not None:
+                if edge == "auto":
+                    pt.pop("edge", None)        # авто = поля нет
+                else:
+                    pt["edge"] = edge
             if t is not None and t != pt.get("t"):
                 pt["t"] = t
                 d["points"].remove(pt)
