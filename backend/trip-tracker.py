@@ -2,14 +2,23 @@
 """
 Мини-бэкенд трека поездки (без внешних зависимостей, только стандартная библиотека).
 
+Каждая точка трека имеет короткий стабильный id (p1, p2, …) и источник src:
+  gps    — живой пинг с телефона (/api/ping)
+  manual — поставлена вручную по карте (/api/point)
+  photo  — координата фотографии, перенесённая в трек (/api/import-photos)
+На id можно ссылаться (в т.ч. вербально: «убери p137») — они не переиспользуются.
+
 Маршруты:
-  GET    /api/trail   -> {"points":[{lat,lng,t,acc?,id?,m?}...], "updated":ts}   (публично)
-  GET    /api/health  -> {"ok":true}
-  POST   /api/ping    -> добавить точку живого трека. Тело {lat,lng,acc?}. Заголовок X-Trip-Key
-  POST   /api/point   -> добавить точку ВРУЧНУЮ. Тело {lat,lng,t?}. Заголовок X-Trip-Key.
-                         Вставляется в трек по времени, помечается {id, m:1}.
-  DELETE /api/point   -> удалить ручную точку по id (?id=...). Заголовок X-Trip-Key
-  DELETE /api/trail   -> очистить трек. Заголовок X-Trip-Key: <секрет>
+  GET    /api/trail          -> {"points":[{id,lat,lng,t,src,acc?,photo?}...], "updated":ts}  (публично)
+  GET    /api/health         -> {"ok":true}
+  POST   /api/ping           -> точка живого трека. Тело {lat,lng,acc?}. Заголовок X-Trip-Key
+  POST   /api/point          -> точка вручную. Тело {lat,lng,t?}. Вставляется в трек по времени
+  PATCH  /api/point?id=pN    -> подвинуть/переставить во времени. Тело {lat?,lng?,t?}
+  DELETE /api/point?id=pN    -> удалить любую точку трека
+  POST   /api/import-photos  -> перенести координаты всех фото в трек точками src=photo.
+                                Идемпотентно: уже перенесённые (по photo=<id фото>) пропускаются
+  DELETE /api/trail          -> очистить трек
+Всё, кроме GET, требует заголовка X-Trip-Key: <секрет>.
 
 (Фото-маршруты /api/photo[s] — ниже в обработчике.)
 Слушает 127.0.0.1:$TRIP_PORT (за nginx). Данные — JSON-файл $TRIP_DATA.
@@ -32,20 +41,53 @@ MAX_BODY   = 4096
 MAX_PHOTO_BODY = 20 * 1024 * 1024   # тело POST /api/photo (JSON с base64 full+thumb)
 MAX_IMG_BYTES  = 8 * 1024 * 1024    # предел на один декодированный JPEG
 MAX_PHOTOS     = 2000               # предел числа фото (защита диска)
-ID_RE          = re.compile(r"^[0-9]+_[0-9a-f]+$")   # формат id, что мы генерим сами
+PHOTO_ID_RE    = re.compile(r"^[0-9]+_[0-9a-f]+$")   # id фото (исторический формат)
+POINT_ID_RE    = re.compile(r"^p[0-9]+$")            # id точки трека — короткий, произносимый
 
 _lock = threading.Lock()
 
 
+def _normalize(d):
+    """Привести трек к текущей модели: у каждой точки есть id (pN) и src.
+    Мигрирует записи старого формата (без id; ручные помечались m:1) при первой
+    загрузке. d['seq'] — счётчик выданных id, монотонный: id удалённой точки
+    не переиспользуется, ссылки на неё не «переезжают» на чужую точку.
+    Возвращает True, если что-то поменяли (тогда файл надо сохранить)."""
+    seq = int(d.get("seq") or 0)
+    changed = False
+    for p in d["points"]:
+        if "m" in p or not p.get("src"):
+            p["src"] = "manual" if p.pop("m", None) else p.get("src") or "gps"
+            changed = True
+        if not POINT_ID_RE.match(str(p.get("id", ""))):
+            seq += 1
+            p["id"] = "p%d" % seq
+            changed = True
+    if seq != d.get("seq"):
+        d["seq"] = seq
+        changed = True
+    return changed
+
+
+def _next_id(d):
+    d["seq"] = int(d.get("seq") or 0) + 1
+    return "p%d" % d["seq"]
+
+
 def _load():
+    d = None
     try:
         with open(DATA, "r", encoding="utf-8") as f:
-            d = json.load(f)
-            if isinstance(d, dict) and isinstance(d.get("points"), list):
-                return d
+            j = json.load(f)
+            if isinstance(j, dict) and isinstance(j.get("points"), list):
+                d = j
     except Exception:
         pass
-    return {"points": [], "updated": 0}
+    if d is None:
+        return {"points": [], "updated": 0, "seq": 0}
+    if _normalize(d):
+        _save(d)               # только после закрытия файла: os.replace поверх открытого — ошибка на Windows
+    return d
 
 
 def _save(d):
@@ -138,6 +180,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, d)
         return self._send(404, {"error": "not found"})
 
+    def do_PATCH(self):
+        if self._path() == "/api/point":
+            return self._point_patch()
+        return self._send(404, {"error": "not found"})
+
     def do_DELETE(self):
         p = self._path()
         if p == "/api/photo":
@@ -158,6 +205,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._photo_post()
         if p == "/api/point":
             return self._point_post()
+        if p == "/api/import-photos":
+            return self._import_photos()
         if p != "/api/ping":
             return self._send(404, {"error": "not found"})
         if not self._authed():
@@ -177,64 +226,114 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(400, {"error": "bad body"})
 
         now = int(time.time())
-        pt = {"lat": round(lat, 6), "lng": round(lng, 6), "t": now}
-        if acc is not None:
-            pt["acc"] = round(acc, 1)
-
         with _lock:
             d = _load()
             pts = d["points"]
+            pt = {"id": None, "lat": round(lat, 6), "lng": round(lng, 6),
+                  "t": now, "src": "gps"}
+            if acc is not None:
+                pt["acc"] = round(acc, 1)
             if pts:
                 last = pts[-1]
                 close = _dist_m((last["lat"], last["lng"]), (lat, lng)) < MIN_DIST_M
-                soon = (now - last["t"]) < MIN_DT_S
+                soon = (now - last.get("t", 0)) < MIN_DT_S
                 if close and soon:
-                    pts[-1] = pt            # обновляем последнюю (свежее время), не плодим точки
+                    pt["id"] = last["id"]   # обновляем последнюю (свежее время) — id держим прежний
+                    pts[-1] = pt
                     d["updated"] = now
                     _save(d)
-                    return self._send(200, {"ok": True, "points": len(pts), "dedup": True})
+                    return self._send(200, {"ok": True, "id": pt["id"],
+                                            "points": len(pts), "dedup": True})
+            pt["id"] = _next_id(d)
             pts.append(pt)
             if len(pts) > MAX_POINTS:
                 d["points"] = pts[-MAX_POINTS:]
             d["updated"] = now
             _save(d)
-            return self._send(200, {"ok": True, "points": len(d["points"])})
+            return self._send(200, {"ok": True, "id": pt["id"], "points": len(d["points"])})
+
+    def _body(self):
+        n = int(self.headers.get("Content-Length", "0"))
+        if n < 0 or n > MAX_BODY:
+            raise ValueError("len")
+        if n == 0:
+            return {}
+        return json.loads(self.rfile.read(n).decode("utf-8"))
+
+    @staticmethod
+    def _coords(body):
+        lat = float(body["lat"]); lng = float(body["lng"])
+        if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+            raise ValueError("range")
+        return round(lat, 6), round(lng, 6)
+
+    @staticmethod
+    def _stamp(t):
+        t = int(t)
+        if not (0 < t < 4102444800):            # 1970 < t < 2100 — отсекаем мусор
+            raise ValueError("t")
+        return t
 
     def _point_post(self):
         """Ручная точка трека: {lat,lng,t?}. t — Unix-секунды (если нет — сейчас).
-        Вставляется по времени, получает id и метку m:1 (чтобы фронт мог её удалить)."""
+        Вставляется в трек по времени, src=manual."""
         if not self._authed():
             return self._send(401, {"error": "bad key"})
         try:
-            n = int(self.headers.get("Content-Length", "0"))
-            if n <= 0 or n > MAX_BODY:
-                raise ValueError("len")
-            body = json.loads(self.rfile.read(n).decode("utf-8"))
-            lat = float(body["lat"]); lng = float(body["lng"])
-            if not (-90 <= lat <= 90 and -180 <= lng <= 180):
-                raise ValueError("range")
-            t = body.get("t")
-            t = int(t) if t is not None else int(time.time())
-            if not (0 < t < 4102444800):        # 1970 < t < 2100 — отсекаем мусор
-                raise ValueError("t")
+            body = self._body()
+            lat, lng = self._coords(body)
+            t = self._stamp(body["t"]) if body.get("t") is not None else int(time.time())
         except Exception:
             return self._send(400, {"error": "bad body"})
 
-        pid = "%d_%s" % (int(time.time()), os.urandom(4).hex())
-        pt = {"lat": round(lat, 6), "lng": round(lng, 6), "t": t, "id": pid, "m": 1}
         with _lock:
             d = _load()
+            pt = {"id": _next_id(d), "lat": lat, "lng": lng, "t": t, "src": "manual"}
             _insert_point(d, pt)
             d["updated"] = int(time.time())
             _save(d)
-            return self._send(200, {"ok": True, "id": pid, "points": len(d["points"])})
+            return self._send(200, {"ok": True, "id": pt["id"], "points": len(d["points"])})
 
-    def _point_delete(self):
-        """Удалить ручную точку по id. Живые точки id не имеют — их так не тронуть."""
+    def _point_patch(self):
+        """Правка точки по id: {lat?,lng?,t?}. Двигаем по карте и/или переставляем во
+        времени (порядок трека = порядок по t, поэтому при смене t переставляем точку)."""
         if not self._authed():
             return self._send(401, {"error": "bad key"})
         pid = (parse_qs(urlparse(self.path).query).get("id") or [""])[0]
-        if not ID_RE.match(pid):
+        if not POINT_ID_RE.match(pid):
+            return self._send(400, {"error": "bad id"})
+        try:
+            body = self._body()
+            move = ("lat" in body or "lng" in body)
+            lat, lng = self._coords(body) if move else (None, None)
+            t = self._stamp(body["t"]) if body.get("t") is not None else None
+            if not move and t is None:
+                raise ValueError("empty")
+        except Exception:
+            return self._send(400, {"error": "bad body"})
+
+        with _lock:
+            d = _load()
+            pt = next((p for p in d["points"] if p.get("id") == pid), None)
+            if pt is None:
+                return self._send(404, {"error": "not found"})
+            if move:
+                pt["lat"] = lat; pt["lng"] = lng
+                pt.pop("acc", None)             # координата уже не «замер GPS с точностью N м»
+            if t is not None and t != pt.get("t"):
+                pt["t"] = t
+                d["points"].remove(pt)
+                _insert_point(d, pt)
+            d["updated"] = int(time.time())
+            _save(d)
+            return self._send(200, {"ok": True, "point": pt})
+
+    def _point_delete(self):
+        """Удалить любую точку трека по id (id не переиспользуется — ссылки не съедут)."""
+        if not self._authed():
+            return self._send(401, {"error": "bad key"})
+        pid = (parse_qs(urlparse(self.path).query).get("id") or [""])[0]
+        if not POINT_ID_RE.match(pid):
             return self._send(400, {"error": "bad id"})
         with _lock:
             d = _load()
@@ -245,6 +344,37 @@ class Handler(BaseHTTPRequestHandler):
             d["updated"] = int(time.time())
             _save(d)
         return self._send(200, {"ok": True, "points": len(keep)})
+
+    def _import_photos(self):
+        """Разово перенести координаты фото в трек точками src=photo (поездка кончилась,
+        новых фото не будет). Идемпотентно: фото, уже перенесённое (есть точка с
+        photo=<id фото>), пропускаем. После импорта путь строится только по трек-точкам,
+        и каждую координату можно двигать/удалять по её id независимо от самого фото."""
+        if not self._authed():
+            return self._send(401, {"error": "bad key"})
+        with _lock:
+            d = _load()
+            photos = _load_photos()["photos"]
+            done = {p["photo"] for p in d["points"] if p.get("photo")}
+            added = []
+            for ph in photos:
+                if not ph.get("id") or ph["id"] in done:
+                    continue
+                try:
+                    lat, lng = self._coords(ph)
+                    t = self._stamp(ph.get("t") or 0)
+                except Exception:
+                    continue                    # фото без валидных координат/времени — не точка трека
+                pt = {"id": _next_id(d), "lat": lat, "lng": lng, "t": t,
+                      "src": "photo", "photo": ph["id"]}
+                _insert_point(d, pt)
+                added.append(pt["id"])
+            if added:
+                d["updated"] = int(time.time())
+                _save(d)
+        return self._send(200, {"ok": True, "added": len(added), "ids": added,
+                                "skipped": len(photos) - len(added),
+                                "points": len(d["points"])})
 
     def _photo_post(self):
         if not self._authed():
@@ -293,7 +423,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authed():
             return self._send(401, {"error": "bad key"})
         pid = (parse_qs(urlparse(self.path).query).get("id") or [""])[0]
-        if not ID_RE.match(pid):
+        if not PHOTO_ID_RE.match(pid):
             return self._send(400, {"error": "bad id"})
         with _lock:
             meta = _load_photos()

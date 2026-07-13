@@ -78,9 +78,12 @@
   .pin-live { width:14px; height:14px; border-radius:50%; background:#0d47a1; border:3px solid #fff;
               box-shadow:0 0 4px rgba(0,0,0,.5); }
   @keyframes pulse { 0%{box-shadow:0 0 0 0 rgba(33,150,243,.55)} 70%{box-shadow:0 0 0 14px rgba(33,150,243,0)} 100%{box-shadow:0 0 0 0 rgba(33,150,243,0)} }
-  /* точка трека, добавленная вручную (видна только владельцу) — фиолетовый ромб */
-  .pin-manual { width:12px; height:12px; background:#7c4dff; border:2px solid #fff;
-                transform:rotate(45deg); box-shadow:0 0 4px rgba(0,0,0,.5); }
+  /* точка трека у владельца — тащится мышью; цвет = источник (GPS / вручную / из фото) */
+  .pin-pt { width:12px; height:12px; border:2px solid #fff; border-radius:50%;
+            box-shadow:0 0 4px rgba(0,0,0,.5); cursor:grab; }
+  .pin-pt.pt-gps    { background:#111; }
+  .pin-pt.pt-manual { background:#7c4dff; border-radius:0; transform:rotate(45deg); }
+  .pin-pt.pt-photo  { background:#f2a900; }
 
   .track-panel { margin:6px 0 12px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
   .track-btn { font:inherit; font-size:12.5px; padding:6px 10px; border:1px solid var(--line);
@@ -102,6 +105,7 @@
   .mpt-add { background:#7c4dff; color:#fff; border-color:#6a3de8; }
   .mpt-add:hover { background:#6a3de8; }
   .mpt-add:disabled { opacity:.6; cursor:default; }
+  .mpt-hint { font-size:11px; color:#888; margin-top:6px; text-align:center; }
   .track-status { font-size:12px; color:#666; }
   .rec-dot { display:inline-block; width:9px; height:9px; border-radius:50%; background:#2e7d32;
              margin-right:5px; animation:pulse 1.6s infinite; }
@@ -221,6 +225,7 @@
       <button class="track-btn" id="locateBtn">📍 Где я</button>
       <button class="track-btn" id="photoBtn" style="display:none">📷 Добавить фото</button>
       <button class="track-btn" id="pointBtn" style="display:none">➕ Точка</button>
+      <button class="track-btn" id="importBtn" style="display:none">📷→📍 Фото в трек</button>
       <input type="file" id="photoInput" accept="image/*" multiple hidden>
       <span class="track-status" id="trackStatus"></span>
     </div>
@@ -237,7 +242,7 @@
 //  этот файл трогать не нужно. Координаты в JSON: [широта, долгота].
 // ============================================================================
 
-console.log('viettrip build: point-times v6');   // маркер версии — видно в консоли, если файл свежий
+console.log('viettrip build: point-ids v7');   // маркер версии — видно в консоли, если файл свежий
 
 // ---- Карта (слои) ----
 const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -411,12 +416,14 @@ function metaText(d){
 
 // ============================ Фотографии точек ============================
 // Владелец (есть секрет записи) грузит фото из галереи; браузер конвертирует их в
-// JPEG и сжимает (полное ≤2048 px, превью ≤400 px). Координаты берём из EXIF самого
+// JPEG и сжимает (полное ≤2048 px, превью ≤200 px). Координаты берём из EXIF самого
 // фото → иначе текущая GPS → иначе тап по карте. Фото видят все; близкие кластеризуются.
 
 // Состояние
+// Координаты фото в пройденный путь напрямую НЕ идут: они разово перенесены в трек
+// точками src:'photo' (кнопка «Фото в трек» → POST /api/import-photos), и путь строится
+// только по точкам трека — их можно двигать и удалять по id.
 let PHOTOS = [], photoLayer = null;
-let onPhotosChanged = null;      // хук: фото — тоже геоточки пройденного пути (ставит init)
 let gridEl = null, viewerEl = null, uploadEl = null;
 let viewSet = [], viewIdx = 0, viewKey = null;
 
@@ -531,7 +538,6 @@ async function loadPhotos(){
     const d = await res.json();
     PHOTOS = (d.photos || []).slice();
     renderPhotoMarkers();
-    if (typeof onPhotosChanged === 'function') onPhotosChanged();   // включить координаты фото в трек
   }catch(e){ /* бэкенда может не быть — не критично */ }
 }
 
@@ -661,7 +667,7 @@ async function startUpload(files, key){
       const ex  = exifGps(buf);
       const img = await loadImg(f);
       const full  = await toJpeg(img, 2048, 0.82);
-      const thumb = await toJpeg(img, 400, 0.72);
+      const thumb = await toJpeg(img, 200, 0.6);
       URL.revokeObjectURL(img.src);
       items.push({ full, thumb, t: ex.t || null,
                    lat: (ex.lat != null ? ex.lat : null), lng: (ex.lng != null ? ex.lng : null),
@@ -934,7 +940,7 @@ function installPhotos(trackKey){
   // Кэш дорог трека в localStorage. Префикс c версией (…:v2:) — чтобы отбросить
   // старые записи прошлого алгоритма (/match мог закэшировать прямые). Держим только
   // актуальный ключ: трек растёт, старое не нужно; заодно чистим устаревшие префиксы.
-  const TRAIL_NS = 'viettrip:trail:v3:';
+  const TRAIL_NS = 'viettrip:trail:v4:';
   function loadTrailRoads(key){
     try{ const v=localStorage.getItem(TRAIL_NS+key); return v?JSON.parse(v):null; }catch(e){ return null; }
   }
@@ -948,26 +954,89 @@ function installPhotos(trackKey){
     }catch(e){ /* переполнение хранилища — не критично */ }
   }
 
-  // Пройденный путь = точки трека + координаты фото, упорядоченные по времени,
-  // со схлопыванием точек ближе 100 м к предыдущей оставленной.
+  // Пройденный путь = ТОЛЬКО точки трека (/api/trail), упорядоченные по времени.
+  // Координаты фотографий перенесены в трек отдельными точками (src:'photo') разово,
+  // на самих фото путь больше не завязан — что видно точками, то и строит линию:
+  // каждую точку можно подвинуть или удалить по её id.
   function traveledPoints(){
-    const raw=[];
-    (trailPoints||[]).forEach(p => { if (isFinite(p.lat)&&isFinite(p.lng)) raw.push({lat:p.lat,lng:p.lng,t:p.t||0,acc:p.acc}); });
-    (PHOTOS||[]).forEach(p     => { if (isFinite(p.lat)&&isFinite(p.lng)) raw.push({lat:p.lat,lng:p.lng,t:p.t||0}); });
-    raw.sort((a,b)=>(a.t||0)-(b.t||0));
-    const out=[];
-    for (const p of raw){
-      const last=out[out.length-1];
-      if (!last || distM([last.lat,last.lng],[p.lat,p.lng])>=100) out.push(p);
-      else if ((p.t||0)>(last.t||0)) last.t=p.t;      // ближе 100 м — схлопнуть, оставить более позднее время
-    }
-    return out;
+    return (trailPoints||[])
+      .filter(p => isFinite(p.lat) && isFinite(p.lng))
+      .map(p => ({ id:p.id, lat:p.lat, lng:p.lng, t:p.t||0, acc:p.acc, src:p.src, photo:p.photo }))
+      .sort((a,b) => a.t - b.t);
   }
 
   function applyRoadLine(line, gen){
     if (gen!==trailGen || !trailLine || !line || line.length<2) return;
     trailLine.setLatLngs(line);
     trailLine.setStyle({ dashArray:null });          // сплошная = едем по дорогам
+  }
+
+  // --- Точки-«хлебные крошки» ---
+  // У каждой точки трека есть свой id (p1, p2, …) — на него можно сослаться, чтобы
+  // поправить путь. Владельцу (секретная ссылка) точка = маркер: тащится мышью/пальцем
+  // (PATCH lat/lng), в попапе — id, источник, время (правится) и удаление.
+  const SRC_LABEL = { gps:'GPS-фикс', manual:'вручную', photo:'из фото' };
+  const SRC_CLASS = { gps:'pt-gps', manual:'pt-manual', photo:'pt-photo' };
+
+  async function patchPoint(p, body){          // подвинуть / переставить во времени
+    try{
+      const r = await fetch('/api/point?id=' + encodeURIComponent(p.id), { method:'PATCH',
+        headers:{ 'Content-Type':'application/json', 'X-Trip-Key':TRACK_KEY },
+        body: JSON.stringify(body) });
+      if (!r.ok){ setStatus('<span style="color:#b00020">не удалось изменить точку</span>'); return false; }
+      const src = trailPoints.find(x => x.id === p.id);
+      if (src) Object.assign(src, body);
+      map.closePopup(); lastDrawnKey = null; redrawTraveled();
+      setStatus(`<span style="color:#0a7">${p.id} обновлена ✓</span>`);
+      return true;
+    }catch(e){ setStatus('<span style="color:#b00020">нет связи с сервером</span>'); return false; }
+  }
+
+  async function deletePoint(p){
+    try{
+      const r = await fetch('/api/point?id=' + encodeURIComponent(p.id),
+                            { method:'DELETE', headers:{ 'X-Trip-Key':TRACK_KEY } });
+      if (!r.ok){ setStatus('<span style="color:#b00020">не удалось удалить точку</span>'); return; }
+      trailPoints = trailPoints.filter(x => x.id !== p.id);
+      map.closePopup(); lastDrawnKey = null; redrawTraveled();
+      setStatus(`<span style="color:#0a7">${p.id} удалена ✓</span>`);
+    }catch(e){ setStatus('<span style="color:#b00020">нет связи с сервером</span>'); }
+  }
+
+  function ownerPointPopup(p){
+    const div = document.createElement('div'); div.className = 'navpop';
+    div.innerHTML =
+      `<div class="navpop-title">Точка <b>${p.id||'—'}</b> · ${SRC_LABEL[p.src] || p.src || '—'}</div>` +
+      `<div class="navpop-coord">${fmtTime(p.t)}<br>${r6(p.lat)}, ${r6(p.lng)}</div>` +
+      `<label class="mpt-lbl">Дата и время</label>` +
+      `<input type="datetime-local" class="mpt-dt" value="${toLocalInput(p.t || 0)}">` +
+      `<div class="mpt-row">` +
+        `<button class="mpt-btn mpt-cancel">🗑 Удалить</button>` +
+        `<button class="mpt-btn mpt-add">Сохранить</button></div>` +
+      `<div class="mpt-hint">Перетащите точку, чтобы подвинуть</div>`;
+    div.querySelector('.mpt-cancel').addEventListener('click', () => deletePoint(p));
+    div.querySelector('.mpt-add').addEventListener('click', () => {
+      const v = div.querySelector('.mpt-dt').value;
+      const t = v ? Math.floor(new Date(v).getTime() / 1000) : 0;
+      if (!isFinite(t) || t <= 0){ setStatus('<span style="color:#b00020">неверная дата</span>'); return; }
+      if (t !== p.t) patchPoint(p, { t }); else map.closePopup();
+    });
+    return div;
+  }
+
+  function pointMarker(p){
+    if (!TRACK_KEY)                                   // гостю — просто «крошка», без правки
+      return L.circleMarker([p.lat,p.lng], { radius:2.5, color:'#111', weight:1, fillOpacity:.6 }).addTo(map);
+    const icon = L.divIcon({ className:'', iconSize:[12,12], iconAnchor:[6,6],
+                             html:`<div class="pin-pt ${SRC_CLASS[p.src] || 'pt-gps'}"></div>` });
+    const m = L.marker([p.lat,p.lng], { icon, draggable:true, zIndexOffset:1100 }).addTo(map);
+    m.on('dragend', e => {
+      const ll = e.target.getLatLng();
+      patchPoint(p, { lat:+ll.lat.toFixed(6), lng:+ll.lng.toFixed(6) });
+    });
+    m.bindPopup(() => ownerPointPopup(p), { maxWidth:260 });
+    m.bindTooltip(p.id || '', { direction:'top', offset:[0,-6] });
+    return m;
   }
 
   function drawTrail(points){
@@ -979,16 +1048,7 @@ function installPhotos(trackKey){
     const ll = points.map(p=>[p.lat,p.lng]);
     // Сначала — сырые прямые между геоточками (пунктир, мгновенная обратная связь)…
     trailLine = L.polyline(ll, { color:'#111', weight:3, opacity:.6, dashArray:'4,6' }).addTo(map);
-    // Точки-«хлебные крошки». Владельцу (секретная ссылка) — крупнее и с попапом даты-времени,
-    // чтобы видеть время соседних точек и осмысленно выставлять время новой ручной точке.
-    points.forEach(p => {
-      const dot = L.circleMarker([p.lat,p.lng],
-        { radius: TRACK_KEY ? 4 : 2.5, color:'#111', weight:1, fillOpacity:.6 }).addTo(map);
-      if (TRACK_KEY) dot.bindPopup(
-        `<div class="navpop-title">Точка трека</div>` +
-        `<div class="navpop-coord">${fmtTime(p.t)}<br>${r6(p.lat)}, ${r6(p.lng)}</div>`);
-      trailDots.push(dot);
-    });
+    points.forEach(p => trailDots.push(pointMarker(p)));
     const last = points[points.length-1];
     const icon = L.divIcon({ className:'', iconSize:[14,14], iconAnchor:[7,7], html:'<div class="pin-live"></div>' });
     const when = new Date((last.t||0)*1000).toLocaleString('ru-RU');
@@ -1008,7 +1068,7 @@ function installPhotos(trackKey){
     }).catch(()=>{ /* маршрут не построился — остаётся сырая линия, повторим на следующем redraw */ });
   }
 
-  // Перерисовать пройденный путь (трек + фото). Пропускаем, только если данные те же
+  // Перерисовать пройденный путь. Пропускаем, только если точки те же
   // И дороги для них уже в кэше (иначе — повторяем построение).
   function redrawTraveled(){
     const pts = traveledPoints();
@@ -1025,7 +1085,6 @@ function installPhotos(trackKey){
       const d = await res.json();
       trailPoints = d.points || [];
       redrawTraveled();
-      redrawManual();
     }catch(e){ /* трекера может не быть — не критично */ }
   }
 
@@ -1056,14 +1115,15 @@ function installPhotos(trackKey){
   });
 
   // --- Режим записи (есть секрет) ---
-  function appendTrailPoint(lat,lng){
-    const t=Math.floor(Date.now()/1000);
-    trailPoints.push({lat,lng,t});             // держим сырой трек в актуальном состоянии
-    lastDrawnKey=null;                         // локально дорисовали — следующий redraw пройдёт заново
-    if(!trailLine){ drawTrail([{lat,lng,t}]); return; }
-    trailLine.addLatLng([lat,lng]);
-    trailDots.push(L.circleMarker([lat,lng],{ radius:2.5, color:'#111', weight:1, fillOpacity:.6 }).addTo(map));
-    if(trailHead) trailHead.setLatLng([lat,lng]);
+  // Сервер вернул id принятой точки (при дедупе — id обновлённой последней): держим
+  // локальный трек в том же виде, что и на сервере, и перерисовываем путь.
+  function appendTrailPoint(lat,lng,acc,id,dedup){
+    const t = Math.floor(Date.now()/1000);
+    const pt = { id, lat, lng, t, acc, src:'gps' };
+    if (dedup && trailPoints.length) trailPoints[trailPoints.length-1] = pt;
+    else trailPoints.push(pt);
+    lastDrawnKey = null;
+    redrawTraveled();
   }
   function startRecording(){
     if(!navigator.geolocation){ setStatus('<span style="color:#b00020">геолокация недоступна</span>'); return; }
@@ -1081,7 +1141,11 @@ function installPhotos(trackKey){
             headers:{ 'Content-Type':'application/json', 'X-Trip-Key':TRACK_KEY },
             body:JSON.stringify({lat,lng,acc}) });
           if(r.status===401){ setStatus('<span style="color:#b00020">неверный ключ записи</span>'); return; }
-          if(r.ok){ appendTrailPoint(lat,lng); setStatus('<span class="rec-dot"></span>запись трека'); }
+          if(r.ok){
+            const j = await r.json().catch(() => ({}));
+            appendTrailPoint(lat, lng, acc, j.id, j.dedup);
+            setStatus('<span class="rec-dot"></span>запись трека');
+          }
         }catch(e){ setStatus('<span style="color:#b00020">нет связи с сервером</span>'); }
       }
     }, err=>{
@@ -1092,8 +1156,7 @@ function installPhotos(trackKey){
   // ================= Ручное добавление точек трека (владелец) =================
   // Забыл открыть страницу с ключом → трек не писался. Здесь можно достроить его:
   // тапнуть по карте, задать дату-время — точка ляжет в трек (POST /api/point) и
-  // попадёт в пройденный путь наравне с GPS-фиксами и координатами фото.
-  const manualLayer = L.layerGroup().addTo(map);
+  // попадёт в пройденный путь наравне с GPS-фиксами и точками из фото.
   let addMode = false;
   let lastManualT = Math.floor(Date.now() / 1000);   // «память» времени: следующая точка +1 мин
   const addHint = '<span class="rec-dot" style="background:#7c4dff"></span>тапайте карту, чтобы добавить точку';
@@ -1101,32 +1164,6 @@ function installPhotos(trackKey){
   function toLocalInput(sec){                          // epoch → значение для <input datetime-local> (локальное время)
     const d = new Date(sec * 1000), p = n => String(n).padStart(2, '0');
     return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
-  }
-
-  // Маркеры ручных точек — только владельцу, для проверки и удаления (в трек-линию они
-  // и так входят через traveledPoints). Строим из сырого trailPoints, без схлопывания —
-  // чтобы каждую можно было удалить, даже если рядом есть другая.
-  function redrawManual(){
-    manualLayer.clearLayers();
-    if (!TRACK_KEY) return;
-    (trailPoints || []).forEach(p => {
-      if (!p.m || !p.id) return;
-      const icon = L.divIcon({ className:'', iconSize:[12,12], iconAnchor:[6,6], html:'<div class="pin-manual"></div>' });
-      const div = document.createElement('div'); div.className = 'navpop';
-      div.innerHTML = `<div class="navpop-title">Точка трека (вручную)</div>` +
-                      `<div class="navpop-coord">${fmtTime(p.t)}<br>${r6(p.lat)}, ${r6(p.lng)}</div>` +
-                      `<button class="mpt-del">🗑 Удалить</button>`;
-      div.querySelector('.mpt-del').addEventListener('click', async () => {
-        try{
-          const r = await fetch('/api/point?id=' + encodeURIComponent(p.id),
-                                { method:'DELETE', headers:{ 'X-Trip-Key':TRACK_KEY } });
-          if (r.ok){ trailPoints = trailPoints.filter(x => x.id !== p.id);
-                     map.closePopup(); lastDrawnKey = null; redrawManual(); redrawTraveled(); }
-          else setStatus('<span style="color:#b00020">не удалось удалить точку</span>');
-        }catch(e){ setStatus('<span style="color:#b00020">нет связи с сервером</span>'); }
-      });
-      L.marker([p.lat, p.lng], { icon, zIndexOffset:1200 }).addTo(manualLayer).bindPopup(div);
-    });
   }
 
   function openAddForm(ll){
@@ -1155,9 +1192,9 @@ function installPhotos(trackKey){
         if (r.status === 401){ setStatus('<span style="color:#b00020">неверный ключ записи</span>'); btn.disabled = false; btn.textContent = 'Добавить'; return; }
         const j = await r.json().catch(() => ({}));
         if (r.ok && j.id){
-          trailPoints.push({ lat, lng, t, id:j.id, m:1 });
+          trailPoints.push({ lat, lng, t, id:j.id, src:'manual' });
           lastManualT = t; lastDrawnKey = null;
-          map.closePopup(pop); redrawManual(); redrawTraveled();
+          map.closePopup(pop); redrawTraveled();
           setStatus('<span style="color:#0a7">точка добавлена ✓</span>');
           setTimeout(() => { if (addMode) setStatus(addHint); }, 1200);
         } else { setStatus('<span style="color:#b00020">не удалось добавить точку</span>'); btn.disabled = false; btn.textContent = 'Добавить'; }
@@ -1174,12 +1211,27 @@ function installPhotos(trackKey){
     if (on) setStatus(addHint); else { map.closePopup(); if (!TRACK_KEY) setStatus(''); }
   }
 
+  // Разовый перенос координат фото в трек (идемпотентно; поездка кончилась — новых фото нет).
+  // После него фотографии остаются на карте, но путь строится только по точкам трека.
+  async function importPhotos(btn){
+    btn.disabled = true; const label = btn.textContent; btn.textContent = '…';
+    try{
+      const r = await fetch('/api/import-photos', { method:'POST', headers:{ 'X-Trip-Key':TRACK_KEY } });
+      const j = await r.json().catch(() => ({}));
+      if (r.ok) setStatus(`<span style="color:#0a7">перенесено точек: ${j.added} (уже были: ${j.skipped})</span>`);
+      else setStatus('<span style="color:#b00020">не удалось перенести фото</span>');
+      await loadTrail();
+    }catch(e){ setStatus('<span style="color:#b00020">нет связи с сервером</span>'); }
+    btn.disabled = false; btn.textContent = label;
+  }
+
   if (TRACK_KEY){
     const pb = document.getElementById('pointBtn');
     if (pb){ pb.style.display = ''; pb.addEventListener('click', () => setAddMode(!addMode)); }
+    const ib = document.getElementById('importBtn');
+    if (ib){ ib.style.display = ''; ib.addEventListener('click', () => importPhotos(ib)); }
   }
 
-  onPhotosChanged = redrawTraveled;   // теперь загрузка/добавление фото перерисовывает пройденный путь
   await loadTrail();
   if(TRACK_KEY){ startRecording(); }
   else { setInterval(() => { loadTrail(); loadPhotos(); }, 30000); }   // просмотр — подтягиваем трек и фото каждые 30 с
