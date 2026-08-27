@@ -62,9 +62,6 @@
                  max-width:min(92vw,430px); display:flex; gap:8px; align-items:center; flex-wrap:wrap;
                  padding:8px 10px; background:rgba(255,255,255,.94); border:1px solid var(--line);
                  border-radius:10px; box-shadow:0 2px 10px rgba(0,0,0,.18); }
-  .track-km { font-size:12px; color:#333; }
-  .track-km b { font-size:13px; }
-  .track-km:empty { display:none; }
   .track-btn { font:inherit; font-size:12.5px; padding:6px 10px; border:1px solid var(--line);
                background:#fff; border-radius:8px; cursor:pointer; }
   .track-btn:hover { box-shadow:0 2px 8px rgba(0,0,0,.12); }
@@ -190,7 +187,6 @@
     <button class="track-btn" id="importBtn" style="display:none">📷→📍 Фото в трек</button>
     <input type="file" id="photoInput" accept="image/*" multiple hidden>
     <span class="track-status" id="trackStatus"></span>
-    <span class="track-km" id="traveledTotal"></span>
   </div>
 </div>
 
@@ -200,7 +196,7 @@
 //  этот файл трогать не нужно. Координаты в JSON: [широта, долгота].
 // ============================================================================
 
-console.log('viettrip build: map-only v11');   // маркер версии — видно в консоли, если файл свежий
+console.log('viettrip build: map-only v12');   // маркер версии — видно в консоли, если файл свежий
 
 // ---- Карта (слои) ----
 const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -943,28 +939,8 @@ function installPhotos(trackKey){
       .sort((a,b) => a.t - b.t);
   }
 
-  // --- Пройдено километров ---
-  // Считаем по той же геометрии, что нарисована: пока дороги строятся — по прямым между
-  // точками (заниженная оценка), потом — по проложенной линии.
-  const traveledEl = document.getElementById('traveledTotal');
-  function lineKm(parts){
-    let m = 0;
-    parts.forEach(a => { for (let i = 1; i < a.length; i++) m += distM(a[i-1], a[i]); });
-    return m / 1000;
-  }
-  function showTraveled(km, straightKm){
-    if (!traveledEl) return;
-    if (!(km > 0)){ traveledEl.innerHTML = ''; return; }
-    const note = straightKm == null
-      ? '<span style="color:#666">по прямым, дороги ещё строятся…</span>'
-      : (straightKm >= 1 ? `<span style="color:#666">из них ≈ ${Math.round(straightKm)} км по прямой (вне дорог)</span>` : '');
-    traveledEl.innerHTML = `<b>≈ ${Math.round(km)} км</b> пройдено${note ? '<br>' + note : ''}`;
-  }
-
   function applyRoadLine(lines, gen){
     if (gen!==trailGen || !lines) return;
-    const straightKm = lineKm(lines.straight);
-    showTraveled(lineKm(lines.road) + straightKm, straightKm);
     if (trailLine){ map.removeLayer(trailLine); trailLine=null; }                    // сырой пунктир больше не нужен
     if (trailRoad){ map.removeLayer(trailRoad); trailRoad=null; }
     if (trailStraight){ map.removeLayer(trailStraight); trailStraight=null; }
@@ -1070,11 +1046,10 @@ function installPhotos(trackKey){
     [trailLine, trailRoad, trailStraight, trailHead].forEach(l => { if (l) map.removeLayer(l); });
     trailLine = trailRoad = trailStraight = trailHead = null;
     trailDots.forEach(m=>map.removeLayer(m)); trailDots=[];
-    if (!points || !points.length){ showTraveled(0); return; }
+    if (!points || !points.length) return;
     const ll = points.map(p=>[p.lat,p.lng]);
     // Сначала — сырые прямые между геоточками (пунктир, мгновенная обратная связь)…
     trailLine = L.polyline(ll, { color:'#111', weight:3, opacity:.6, dashArray:'4,6' }).addTo(map);
-    showTraveled(lineKm([ll]), null);            // черновая оценка, пока не построены дороги
     points.forEach(p => trailDots.push(pointMarker(p)));
     const last = points[points.length-1];
     const icon = L.divIcon({ className:'', iconSize:[14,14], iconAnchor:[7,7], html:'<div class="pin-live"></div>' });
